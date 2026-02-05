@@ -1,5 +1,6 @@
 package dslabs.atmostonce;
 
+import dslabs.framework.Address;
 import dslabs.framework.Application;
 import dslabs.framework.Command;
 import dslabs.framework.Result;
@@ -8,6 +9,8 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import lombok.ToString;
+import java.util.Map;
+import java.util.HashMap;
 
 @EqualsAndHashCode
 @ToString
@@ -16,6 +19,7 @@ public final class AMOApplication<T extends Application> implements Application 
   @Getter @NonNull private final T application;
 
   // Your code here...
+  private Map<Address, AMOResult> results = new HashMap<>();
 
   @Override
   public AMOResult execute(Command command) {
@@ -26,7 +30,10 @@ public final class AMOApplication<T extends Application> implements Application 
     AMOCommand amoCommand = (AMOCommand) command;
 
     // Your code here...
-    return null;
+    if(!alreadyExecuted(amoCommand)) {
+      results.put(amoCommand.address(), new AMOResult(amoCommand.sequenceNumber(), application.execute(amoCommand.command())));
+    }
+    return results.get(amoCommand.address());
   }
 
   public Result executeReadOnly(Command command) {
@@ -43,6 +50,10 @@ public final class AMOApplication<T extends Application> implements Application 
 
   public boolean alreadyExecuted(AMOCommand amoCommand) {
     // Your code here...
+    AMOResult res = results.get(amoCommand.address());
+    if(res != null && res.sequenceNumber() >= amoCommand.sequenceNumber()) {
+      return true;
+    }
     return false;
   }
 }

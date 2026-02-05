@@ -17,6 +17,8 @@ import dslabs.kvstore.KVStore.AppendResult;
 import dslabs.kvstore.KVStore.KeyNotFound;
 import dslabs.kvstore.KVStore;
 import dslabs.clientserver.Request;
+import dslabs.atmostonce.AMOCommand;
+import dslabs.atmostonce.AMOResult;
 
 /**
  * Simple client that sends requests to a single server and returns responses.
@@ -52,15 +54,13 @@ class SimpleClient extends Node implements Client {
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
-    if(command instanceof Get) {
-      request = new Request((Get)command, sequenceNum+1);
-    } else if(command instanceof Put) {
-      request = new Request((Put)command, sequenceNum+1);
-    } else if(command instanceof Append) {
-      request = new Request((Append)command, sequenceNum+1);
-    } else {
+    AMOCommand amoCommand;
+    if(command instanceof Get || command instanceof Put || command instanceof Append) {
+      amoCommand = new AMOCommand(command, sequenceNum + 1, address()); 
+    }  else {
       throw new IllegalArgumentException();
     }
+    request = new Request(amoCommand);
     sequenceNum++;
     result = null;
     send(request, serverAddress);
@@ -86,20 +86,14 @@ class SimpleClient extends Node implements Client {
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void handleReply(Reply m, Address sender) {
     // Your code here...
-    if(request != null && m.sequenceNum() != request.sequenceNum()) {
+    if(!(m.result() instanceof AMOResult)) {
       return;
     }
-    if(m.result() instanceof GetResult) {
-      result = (GetResult)(m.result());
-    } else if(m.result() instanceof PutOk) {
-      result = (PutOk)(m.result());
-    } else if(m.result() instanceof AppendResult) {
-      result = (AppendResult)(m.result());
-    } else if(m.result() instanceof KeyNotFound) {
-      result = (KeyNotFound)(m.result());
-    } else {
+    AMOResult res = (AMOResult)(m.result());
+    if(request != null && res.sequenceNumber() != sequenceNum) {
       return;
     }
+    this.result = res.result();
     notify();
   }
 
