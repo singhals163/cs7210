@@ -60,7 +60,16 @@ public class KVStore implements Application {
   }
 
   // Your code here...
+  @Data
+  public static final class Init implements KVStoreCommand {
+    @NonNull private final Map<String, String> store;
+  }
+
+  @Data
+  public static final class InitOK implements KVStoreResult {}
+
   private Map<String, String> store = new HashMap<>();
+
 
   @Override
   public KVStoreResult execute(Command command) {
@@ -88,6 +97,12 @@ public class KVStore implements Application {
       value += a.value();
       store.put(a.key(), value);
       return new AppendResult(value);
+    }
+
+    if (command instanceof Init) {
+      Init i = (Init) command;
+      store = i.store;
+      return new InitOK();
     }
 
     throw new IllegalArgumentException();
