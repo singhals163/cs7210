@@ -20,7 +20,17 @@ class ViewServer extends Node {
   private static final int PING_MISSES_AVAILABLE = 2;
 
   // Your code here...
-  private Map<Address, Integer> servers = new HashMap<>();
+  private static class ServerInfo {
+    int missesRemaining;
+    int maxViewNumSeen;
+
+    ServerInfo(int misses, int viewNum) {
+      this.missesRemaining = misses;
+      this.maxViewNumSeen = viewNum;
+    }
+  }
+
+  private final Map<Address, ServerInfo> servers = new HashMap<>();
   private View currentView;
   private boolean primaryAck;
 
@@ -44,10 +54,20 @@ class ViewServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void handlePing(Ping m, Address sender) {
     // Your code here...
-    if(m.viewNum() == currentView.viewNum() && Objects.equal(sender, currentView.primary())) {
+    ServerInfo info = servers.get(sender);
+    if (info == null) {
+      servers.put(sender, new ServerInfo(PING_MISSES_AVAILABLE, m.viewNum()));
+    } else {
+      if (m.viewNum() < info.maxViewNumSeen) {
+        return;
+      }
+      info.missesRemaining = PING_MISSES_AVAILABLE;
+      info.maxViewNumSeen = m.viewNum();
+    }
+
+    if (m.viewNum() == currentView.viewNum() && sender.equals(currentView.primary())) {
       primaryAck = true;
     }
-    servers.put(sender, PING_MISSES_AVAILABLE);
     generateNewView();
     send(new ViewReply(currentView), sender);
   }
@@ -62,85 +82,76 @@ class ViewServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void onPingCheckTimer(PingCheckTimer t) {
     // Your code here...
-    set(t, PING_CHECK_MILLIS);
-    servers.replaceAll((key, value) -> value - 1);
-    servers.entrySet().removeIf(entry -> entry.getValue() == 0);
-    if(!servers.containsKey(currentView.primary()) || !servers.containsKey(currentView.backup())) {
-      generateNewView();
+    for (ServerInfo info : servers.values()) {
+      if (info.missesRemaining > 0) {
+        info.missesRemaining--;
+      }
     }
+    generateNewView();
+    set(t, PING_CHECK_MILLIS);
   }
 
   /* -----------------------------------------------------------------------------------------------
    *  Utils
    * ---------------------------------------------------------------------------------------------*/
   // Your code here...
-  private void generateNewView(){
-    Address primary = null, backup = null;
-    if(currentView.viewNum() == STARTUP_VIEWNUM) {
-      for(Map.Entry<Address, Integer> entry: servers.entrySet()) {
-        if(primary == null) {
-          primary = entry.getKey();
-        } else {
-          backup = entry.getKey();
+  private boolean isAlive(Address a) {
+    return a != null && servers.containsKey(a) && servers.get(a).missesRemaining > 0;
+  }
+  
+  private void generateNewView() {
+    if (currentView.viewNum() == STARTUP_VIEWNUM) {
+      Address primary = null;
+      Address backup = null;
+
+      for (Address a : servers.keySet()) {
+        if (!isAlive(a)) continue;
+        if (primary == null) primary = a;
+        else if (backup == null) backup = a;
+        else break; 
+      }
+
+      if (primary != null) {
+        currentView = new View(INITIAL_VIEWNUM, primary, backup);
+        primaryAck = false; // New view needs new ack
+      }
+      return;
+    }
+
+    if (!primaryAck) {
+      return;
+    }
+
+    Address currentPrimary = currentView.primary();
+    Address currentBackup = currentView.backup();
+
+    Address newPrimary = currentPrimary;
+    Address newBackup = currentBackup;
+
+    if (!isAlive(currentPrimary)) {
+      newPrimary = currentBackup; 
+      newBackup = null; 
+    }
+    if (!isAlive(newBackup)) {
+      newBackup = null;
+    }
+    if (newBackup == null) {
+      for (Address a : servers.keySet()) {
+        if (isAlive(a) && !a.equals(newPrimary)) {
+          newBackup = a;
           break;
         }
       }
-      if(primary != null) {
-        currentView = new View(INITIAL_VIEWNUM, primary, backup);
-      }
-      return;
-    } 
-    if(primaryAck == true) {
-      if(servers.containsKey(currentView.primary())) {
-        primary = currentView.primary();
-        if(currentView.backup() != null && servers.containsKey(currentView.backup())) {
-          LOG.finest(String.format("exit at A"));
-          return;
+    }
+
+    boolean primaryChanged = (newPrimary != null && !newPrimary.equals(currentView.primary())) || (newPrimary == null && currentView.primary() != null);
+    boolean backupChanged = (newBackup != null && !newBackup.equals(currentView.backup())) || (newBackup == null && currentView.backup() != null);
+
+    if (primaryChanged || backupChanged) {
+        if (newPrimary != null) {
+            currentView = new View(currentView.viewNum() + 1, newPrimary, newBackup);
+            primaryAck = false;
         }
-        for(Map.Entry<Address, Integer> entry: servers.entrySet()) {
-          if(!Objects.equal(entry.getKey(), primary)) {
-            backup = entry.getKey();
-            break;
-          }
-        }
-        if(currentView.backup() != backup) {
-          LOG.finest(String.format("exit at B"));
-          primaryAck = false;
-          currentView = new View(currentView.viewNum() + 1, primary, backup);
-        }
-        return;
-      } else if(servers.containsKey(currentView.backup())) {
-        primary = currentView.backup();
-        for(Map.Entry<Address, Integer> entry: servers.entrySet()) {
-          if(!Objects.equal(entry.getKey(), primary)) {
-            backup = entry.getKey();
-            break;
-          }
-        }
-        primaryAck = false;
-        currentView = new View(currentView.viewNum() + 1, primary, backup);
-        LOG.finest(String.format("exit at C"));
-        return;
-      } else {
-        // both are dead, if there is a new server available, make it backup
-        primary = currentView.primary();
-        for(Map.Entry<Address, Integer> entry: servers.entrySet()) {
-          if(!Objects.equal(entry.getKey(), primary)) {
-            backup = entry.getKey();
-            break;
-          }
-        }
-        if(backup != null) {
-          primaryAck = false;
-          currentView = new View(currentView.viewNum() + 1, primary, backup);
-        }
-        LOG.finest(String.format("exit at E"));
-        return;
-      }
-    } else {
-      // primary hasn't acked yet, can't do anything
-      LOG.finest(String.format("exit at F"));
-      return;
     }
   }
 }
