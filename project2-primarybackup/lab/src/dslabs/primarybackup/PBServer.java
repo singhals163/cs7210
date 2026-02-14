@@ -46,30 +46,10 @@ class PBServer extends Node {
     send(new Ping(currentView.viewNum()), viewServer);
     set(new PingTimer(), PING_MILLIS);
   }
-
+  
   /* -----------------------------------------------------------------------------------------------
-   *  Message Handlers
-   * ---------------------------------------------------------------------------------------------*/
-  // private void handleRequest(Request m, Address sender) {
-  //   // Your code here...
-  //   if(m instanceof CSRequest) {
-  //     if(isPrimary) {
-  //       // execute request
-  //       // send the request to the backup
-  //       // wait for response
-  //       // if succeed, return
-  //       // if not,        
-  //       AMOResult result = app.execute(m.command());
-  //       send(new Reply(result), sender);
-  //     } else {
-  //       // can't take reqeusts from clients, return error
-  //       // TODO: need to send an AMOResult? 
-  //       send(new PBReply(CSError), sender);
-  //     }
-  //   } else if(m instanceof PBRequest) {
-
-  //   }
-  // }
+  *  Message Handlers
+  * ---------------------------------------------------------------------------------------------*/
 
   private void handleViewReply(ViewReply m, Address sender) {
     // Your code here...
@@ -86,8 +66,6 @@ class PBServer extends Node {
     }
   }
 
-  // Your code here...
-
   /* -----------------------------------------------------------------------------------------------
    *  Timer Handlers
    * ---------------------------------------------------------------------------------------------*/
@@ -101,16 +79,11 @@ class PBServer extends Node {
     set(t, PING_MILLIS);
   }
 
-  // Your code here...
-
   /* -----------------------------------------------------------------------------------------------
    *  Utils
    * ---------------------------------------------------------------------------------------------*/
   // Your code here...
   
-
-
-
   /* -----------------------------------------------------------------------------------------------
    * Init backup handling logic
    * ---------------------------------------------------------------------------------------------*/
@@ -149,9 +122,10 @@ class PBServer extends Node {
     AMOResult result = app.execute(m.command());
     send(new PBInitReply(currentView.viewNum(), result), sender);
   }
+  
   private void handlePBInitReply(PBInitReply m, Address sender) {
     if(m.viewNum() > currentView.viewNum()) {
-      // send Ping to viewserver
+      // sending a new ping as my view is old
       send(new Ping(currentView.viewNum()), viewServer);
     } else if(m.viewNum() < currentView.viewNum() || m.result() == null) {
       // TODO: send the command again
@@ -169,6 +143,7 @@ class PBServer extends Node {
   /* -----------------------------------------------------------------------------------------------
    * Primary-Backup update messages
    * ---------------------------------------------------------------------------------------------*/
+
   private void sendNextPBCommand() {
     AMOCommand c = clientRequests.peek();
     if(c != null && currentView != null && currentView.backup() != null) {
@@ -212,7 +187,6 @@ class PBServer extends Node {
    * Client-server requests handling logic
    * ---------------------------------------------------------------------------------------------*/
 
-
   private void handleCSRequest(CSRequest m, Address sender) {
     if(m.viewNum() != currentView.viewNum()) {
       send(new CSReply(currentView.viewNum(), null), sender);
@@ -221,7 +195,6 @@ class PBServer extends Node {
       }
       return;
     }
-
     AMOResult result = app.execute(m.command());
     if(((AMOCommand)m.command()).command() instanceof Get || currentView.backup() == null) {
       send(new CSReply(currentView.viewNum(), result), sender);
@@ -230,6 +203,4 @@ class PBServer extends Node {
     clientRequests.add((AMOCommand)m.command());
     sendNextPBCommand();
   }
-
-
 }

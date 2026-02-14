@@ -73,10 +73,7 @@ class PBClient extends Node implements Client {
   /* -----------------------------------------------------------------------------------------------
    *  Message Handlers
    * ---------------------------------------------------------------------------------------------*/
-  private synchronized void handleReply(Reply m, Address sender) {
-    // Your code here...
     
-  }
   private void retryCommand() {
     if (currentCommand != null && result == null && currentView != null && currentView.primary() != null) {
         send(new CSRequest(currentView.viewNum(), currentCommand), currentView.primary());
@@ -120,7 +117,6 @@ class PBClient extends Node implements Client {
   }
 
   private synchronized void onPingTimer(PingTimer t) {
-    // Your code here...
     send(new GetView(), viewServer);
     set(t, PingTimer.PING_MILLIS);
   }
