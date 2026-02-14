@@ -150,13 +150,16 @@ class PBServer extends Node {
   /* -----------------------------------------------------------------------------------------------
    * Primary-Backup update messages
    * ---------------------------------------------------------------------------------------------*/
-
-  private void onPBCommandTimer(PBCommandTimer t) {
-    if(t.viewNum() != currentView.viewNum()) return;
+  private void sendNextPBCommand() {
     AMOCommand c = clientRequests.peek();
     if(c != null) {
       send(new PBCommandRequest(currentView.viewNum(), c), currentView.backup());
     }
+  }
+  
+  private void onPBCommandTimer(PBCommandTimer t) {
+    if(t.viewNum() != currentView.viewNum()) return;
+    sendNextPBCommand();
     set(t, PB_COMMAND_MILLIS);
   }
 
@@ -176,6 +179,7 @@ class PBServer extends Node {
       if (!Objects.equal(c, m.command())) return;
       clientRequests.remove();
       send(new CSReply(currentView.viewNum(), m.result()), c.address());
+      sendNextPBCommand();
     } 
   }
 
