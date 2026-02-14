@@ -21,3 +21,14 @@ final class ClientTimer implements Timer {
 }
 
 // Your code here...
+@Data
+final class InitTimer implements Timer {
+  final int viewNum;
+  static final int INIT_MILLIS = 25;
+}
+
+@Data
+final class PBCommandTimer implements Timer {
+  final int viewNum;
+  static final int PB_COMMAND_MILLIS = 25;
+}

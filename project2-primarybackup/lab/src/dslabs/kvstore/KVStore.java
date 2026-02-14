@@ -107,4 +107,8 @@ public class KVStore implements Application {
 
     throw new IllegalArgumentException();
   }
+
+  public Init generateInitCommand() {
+    return new Init(store);
+  }
 }
