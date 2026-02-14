@@ -1,7 +1,6 @@
 package dslabs.primarybackup;
 
-import org.junit.internal.requests.ClassRequest;
-
+import com.google.common.base.Objects;
 import dslabs.framework.Address;
 import dslabs.framework.Client;
 import dslabs.framework.Command;
@@ -9,6 +8,8 @@ import dslabs.framework.Node;
 import dslabs.framework.Result;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
+import dslabs.kvstore.KVStore.*;
+import dslabs.atmostonce.*;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -33,7 +34,7 @@ class PBClient extends Node implements Client {
   public synchronized void init() {
     // Your code here...
     send(new GetView(), viewServer);
-    set(new PingTimer(), PingTimer.PING_MILLIS());
+    set(new PingTimer(), PingTimer.PING_MILLIS);
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -42,8 +43,7 @@ class PBClient extends Node implements Client {
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
-    if(currentView.primary() == null) {
-      // Connection not established yet
+    if(currentView == null || currentView.primary() == null) {
       return;
     } 
     if(command instanceof Get || command instanceof Put || command instanceof Append) {
@@ -52,7 +52,7 @@ class PBClient extends Node implements Client {
 
       request = new CSRequest(currentView.viewNum(), amoCommand);
       send(request, currentView.primary());
-      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS());
+      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS);
     } else {
       throw new IllegalArgumentException();
     }
@@ -87,7 +87,7 @@ class PBClient extends Node implements Client {
 
   // Your code here...
   private synchronized void handleCSReply(CSReply m, Address sender) {
-    if(m.viewNum != currentView.viewNum() || m.result == null) return;
+    if(m.viewNum() != currentView.viewNum() || m.result() == null) return;
     AMOResult res = (AMOResult)(m.result());
     if(request != null && res.sequenceNumber() != sequenceNum) {
       return;
@@ -104,13 +104,13 @@ class PBClient extends Node implements Client {
     if(Objects.equal(request, t.request()) && result == null) {
       this.request = new CSRequest(currentView.viewNum(), this.request.command());
       send(request, currentView.primary());
-      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS());
+      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS);
     }
   }
 
-  private synchronized void onPingTimer(ClientTimer t) {
+  private synchronized void onPingTimer(PingTimer t) {
     // Your code here...
     send(new GetView(), viewServer);
-    set(t, PING_MILLIS);
+    set(t, PingTimer.PING_MILLIS);
   }
 }

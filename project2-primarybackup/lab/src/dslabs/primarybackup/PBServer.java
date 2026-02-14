@@ -6,10 +6,14 @@ import static dslabs.primarybackup.PBCommandTimer.PB_COMMAND_MILLIS;
 import dslabs.framework.Address;
 import dslabs.framework.Application;
 import dslabs.framework.Node;
+import lombok.EqualsAndHashCode;
+import lombok.ToString;
 import dslabs.atmostonce.AMOApplication;
 import java.util.Queue;
 import java.net.Authenticator.RequestorType;
 import java.util.LinkedList;
+import dslabs.atmostonce.*;
+import dslabs.kvstore.KVStore.*;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -31,7 +35,7 @@ class PBServer extends Node {
 
     // Your code here...
     backupReady = false;
-    currentView = new View(STARTUP_VIEWNUM, null, null);
+    currentView = new View(ViewServer.STARTUP_VIEWNUM, null, null);
     this.app = new AMOApplication<>(app);
   }
 
@@ -73,7 +77,7 @@ class PBServer extends Node {
       currentView = reply;
       backupReady = false;
       if(currentView.primary() == this.address()) {
-        send(new Ping(currentView.viewNum), viewServer);
+        send(new Ping(currentView.viewNum()), viewServer);
         startBackupInit();
       } 
     }
@@ -86,7 +90,7 @@ class PBServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void onPingTimer(PingTimer t) {
     // Your code here...
-    send(new Ping(viewNum), viewServer);
+    send(new Ping(currentView.viewNum()), viewServer);
     set(t, PING_MILLIS);
   }
 
@@ -107,17 +111,19 @@ class PBServer extends Node {
   private void startBackupInit() {
     // If currentView has a backup, send a generateInitCommand to the backup
     if(currentView.backup() != null && backupReady == false) {
-      send(new PBInitRequest(currentView.viewNum(), app.generateInitCommand()), currentView.backup());
-      // TODO: check if this timer initialization works
-      set(new InitTimer(currentView.viewNum()), INIT_MILLIS);
+      AMOResult result = app.execute(new AMOCommand(new GetInit(), 1, this.address()));
+      AMOCommand command = new AMOCommand(new Init(((GetInitResult)result.result()).store()), 1, this.address());
+      PBInitRequest req = new PBInitRequest(currentView.viewNum(), command);
+      send(req, currentView.backup());
+      set(new InitTimer(currentView.viewNum(), req), INIT_MILLIS);
     }
   }
   
   private void onInitTimer(InitTimer t) {
     if(t.viewNum() != currentView.viewNum()) return;
     if(backupReady == false) {
+      send(t.request(), currentView.backup());
       set(t, INIT_MILLIS);
-      send(new PBInitRequest(currentView.viewNum(), app.generateInitCommand()), currentView.backup());
     }
   } 
 
@@ -125,11 +131,11 @@ class PBServer extends Node {
   // accept the request and return an OK reply
   // else return an error
   private void handlePBInitRequest(PBInitRequest m, Address sender) {
-    if(currentView.viewNum != m.viewNum) {
+    if(currentView.viewNum() != m.viewNum()) {
       send(new PBInitReply(currentView.viewNum(), null), sender);
       return;
     }
-    KVStoreResult result = app.execute(m.command());
+    AMOResult result = app.execute(m.command());
     send(new PBInitReply(currentView.viewNum(), result), sender);
   }
   // TODO: What if an old reply comes? 
@@ -159,13 +165,13 @@ class PBServer extends Node {
       return;
     }
     AMOResult result = app.execute(m.command());
-    send(new PBCommandResult(currentView.viewNum(), result, m.command()), sender);
+    send(new PBCommandReply(currentView.viewNum(), result, m.command()), sender);
   }
 
   private void handlePBCommandReply(PBCommandReply m, Address sender) {
     if(m.viewNum() == currentView.viewNum()) {
       if(m.result() == null) return;
-      CSCommand c = clientRequests.peek();
+      AMOCommand c = clientRequests.peek();
       if (c != m.command()) return;
       clientRequests.remove();
       send(new CSReply(currentView.viewNum(), m.result()), c.address());
@@ -187,7 +193,7 @@ class PBServer extends Node {
       send(new CSReply(currentView.viewNum(), result), sender);
       return;
     }
-    clientRequests.add(m.command());
+    clientRequests.add((AMOCommand)m.command());
   }
 
 

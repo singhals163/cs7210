@@ -2,7 +2,9 @@ package dslabs.primarybackup;
 
 import dslabs.framework.Command;
 import dslabs.framework.Message;
+import dslabs.framework.Result;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 
 /* -----------------------------------------------------------------------------------------------
  *  ViewServer Messages

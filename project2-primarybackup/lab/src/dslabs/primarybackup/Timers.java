@@ -18,18 +18,19 @@ final class ClientTimer implements Timer {
   static final int CLIENT_RETRY_MILLIS = 100;
 
   // Your code here...
-  Request request;
+  private final Request request;
 }
 
 // Your code here...
 @Data
 final class InitTimer implements Timer {
-  final int viewNum;
   static final int INIT_MILLIS = 25;
+  final int viewNum;
+  final Request request;
 }
 
 @Data
 final class PBCommandTimer implements Timer {
-  final int viewNum;
   static final int PB_COMMAND_MILLIS = 25;
+  final int viewNum;
 }
