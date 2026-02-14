@@ -1,5 +1,7 @@
 package dslabs.primarybackup;
 
+import org.junit.internal.requests.ClassRequest;
+
 import dslabs.framework.Address;
 import dslabs.framework.Client;
 import dslabs.framework.Command;
@@ -14,6 +16,10 @@ class PBClient extends Node implements Client {
   private final Address viewServer;
 
   // Your code here...
+  private Request request;
+  private Result result;
+  private View currentView;
+  private int sequenceNum = 0;
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -26,6 +32,8 @@ class PBClient extends Node implements Client {
   @Override
   public synchronized void init() {
     // Your code here...
+    send(new GetView(), viewServer);
+    set(new PingTimer(), PingTimer.PING_MILLIS());
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -34,18 +42,34 @@ class PBClient extends Node implements Client {
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
+    if(currentView.primary() == null) {
+      // Connection not established yet
+      return;
+    } 
+    if(command instanceof Get || command instanceof Put || command instanceof Append) {
+      sequenceNum++;
+      AMOCommand amoCommand = new AMOCommand(command, sequenceNum, this.address());
+
+      request = new CSRequest(currentView.viewNum(), amoCommand);
+      send(request, currentView.primary());
+      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS());
+    } else {
+      throw new IllegalArgumentException();
+    }
   }
 
   @Override
   public synchronized boolean hasResult() {
     // Your code here...
-    return false;
+    return result != null;
   }
 
   @Override
   public synchronized Result getResult() throws InterruptedException {
     // Your code here...
-    return null;
+    while(!hasResult())
+      wait();
+    return result;
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -53,18 +77,40 @@ class PBClient extends Node implements Client {
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void handleReply(Reply m, Address sender) {
     // Your code here...
+    
   }
 
   private synchronized void handleViewReply(ViewReply m, Address sender) {
     // Your code here...
+    currentView = m.view();
   }
 
   // Your code here...
+  private synchronized void handleCSReply(CSReply m, Address sender) {
+    if(m.viewNum != currentView.viewNum() || m.result == null) return;
+    AMOResult res = (AMOResult)(m.result());
+    if(request != null && res.sequenceNumber() != sequenceNum) {
+      return;
+    }
+    this.result = res.result();
+    notify();
+  }
 
   /* -----------------------------------------------------------------------------------------------
    *  Timer Handlers
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void onClientTimer(ClientTimer t) {
     // Your code here...
+    if(Objects.equal(request, t.request()) && result == null) {
+      this.request = new CSRequest(currentView.viewNum(), this.request.command());
+      send(request, currentView.primary());
+      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS());
+    }
+  }
+
+  private synchronized void onPingTimer(ClientTimer t) {
+    // Your code here...
+    send(new GetView(), viewServer);
+    set(t, PING_MILLIS);
   }
 }

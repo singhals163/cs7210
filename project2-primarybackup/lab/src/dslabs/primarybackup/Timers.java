@@ -18,6 +18,7 @@ final class ClientTimer implements Timer {
   static final int CLIENT_RETRY_MILLIS = 100;
 
   // Your code here...
+  Request request;
 }
 
 // Your code here...

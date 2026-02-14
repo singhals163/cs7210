@@ -20,7 +20,7 @@ class PBServer extends Node {
   private boolean backupReady;
   private View currentView;
   private final AMOApplication<Application> app;
-  private Queue<CSRequest> clientRequests = new LinkedList<>(); 
+  private Queue<AMOCommand> clientRequests = new LinkedList<>(); 
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -134,7 +134,7 @@ class PBServer extends Node {
   }
   // TODO: What if an old reply comes? 
   private void handlePBInitReply(PBInitReply m, Address sender) {
-    if(m.viewNum() == currentView.viewNum()) {
+    if(m.viewNum() == currentView.viewNum() && m.result() != null) {
       backupReady = true;
       set(new PBCommandTimer(currentView.viewNum()), PB_COMMAND_MILLIS);
     }
@@ -146,34 +146,30 @@ class PBServer extends Node {
 
   private void onPBCommandTimer(PBCommandTimer t) {
     if(t.viewNum() != currentView.viewNum()) return;
-    CSREquest c = clientRequests.peek();
+    AMOCommand c = clientRequests.peek();
     if(c != null) {
-      send(new PBCommandRequest(currentView.viewNum(), c.command()), currentView.backup());
+      send(new PBCommandRequest(currentView.viewNum(), c), currentView.backup());
     }
     set(t, PB_COMMAND_MILLIS);
   }
 
   private void handlePBCommandRequest(PBCommandRequest m, Address sender) {
     if(currentView.viewNum() != m.viewNum()) {
-      send(new PBCommandReply(currentView.viewNum(), null), sender);
+      send(new PBCommandReply(currentView.viewNum(), null, null), sender);
       return;
     }
-    KVStoreResult result = app.execute(m.command());
-    send(new PBCommandResult(currentView.viewNum(), result), sender);
+    AMOResult result = app.execute(m.command());
+    send(new PBCommandResult(currentView.viewNum(), result, m.command()), sender);
   }
 
   private void handlePBCommandReply(PBCommandReply m, Address sender) {
-    // check the reply
-    // else m.viewNum == currentView.viewNum
-    //    poll the top of the queue and if it is the response for that command, send the reply and remove the request from the queue.
     if(m.viewNum() == currentView.viewNum()) {
-      CSReqeust c = clientRequests.peek();
-      // TODO: use AMO for correct implementation
-      if(c != null) {
-        clientRequests.remove();
-        send(new CSReply(currentView.viewNum(), m.result()), c.sender())
-      }
-    }
+      if(m.result() == null) return;
+      CSCommand c = clientRequests.peek();
+      if (c != m.command()) return;
+      clientRequests.remove();
+      send(new CSReply(currentView.viewNum(), m.result()), c.address());
+    } 
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -186,12 +182,12 @@ class PBServer extends Node {
       send(new CSReply(currentView.viewNum(), null), sender);
     }
 
-    KVStoreResult result = app.execute(m.command());
-    if(m.command() instanceof Get) {
+    AMOResult result = app.execute(m.command());
+    if(m.command() instanceof Get || currentView.backup() == null) {
       send(new CSReply(currentView.viewNum(), result), sender);
       return;
     }
-    clientRequests.add(m);
+    clientRequests.add(m.command());
   }
 
 

@@ -50,8 +50,10 @@ class PBCommandRequest extends Request {
 @EqualsAndHashCode(callSuper = true)
 @Data
 class PBCommandReply extends Reply {
-  public PBCommandReply(int viewNum, Result result) {
+  private final Command command; 
+  public PBCommandReply(int viewNum, Result result, Command command) {
         super(viewNum, result);
+        this.command = command;
     }
 }
 
@@ -74,10 +76,8 @@ class PBInitReply extends Reply {
 @EqualsAndHashCode(callSuper = true)
 @Data
 class CSRequest extends Request {
-  Address sender;
-  public CSRequest(int viewNum, Command command, Address a) {
+  public CSRequest(int viewNum, Command command) {
     super(viewNum, command);
-    sender = a;
   }
 }
 
