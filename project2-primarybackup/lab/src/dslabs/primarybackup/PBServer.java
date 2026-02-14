@@ -1,5 +1,6 @@
 package dslabs.primarybackup;
 
+import com.google.common.base.Objects;
 import static dslabs.primarybackup.PingTimer.PING_MILLIS;
 import static dslabs.primarybackup.InitTimer.INIT_MILLIS;
 import static dslabs.primarybackup.PBCommandTimer.PB_COMMAND_MILLIS;
@@ -172,7 +173,7 @@ class PBServer extends Node {
     if(m.viewNum() == currentView.viewNum()) {
       if(m.result() == null) return;
       AMOCommand c = clientRequests.peek();
-      if (c != m.command()) return;
+      if (!Objects.equal(c, m.command())) return;
       clientRequests.remove();
       send(new CSReply(currentView.viewNum(), m.result()), c.address());
     } 
