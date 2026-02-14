@@ -11,12 +11,12 @@ final class PingCheckTimer implements Timer {
 
 @Data
 final class PingTimer implements Timer {
-  static final int PING_MILLIS = 50;
+  static final int PING_MILLIS = 25;
 }
 
 @Data
 final class ClientTimer implements Timer {
-  static final int CLIENT_RETRY_MILLIS = 25;
+  static final int CLIENT_RETRY_MILLIS = 100;
 
   // Your code here...
   private final Command command;

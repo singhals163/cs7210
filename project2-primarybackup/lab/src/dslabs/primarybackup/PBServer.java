@@ -78,8 +78,10 @@ class PBServer extends Node {
       currentView = reply;
       backupReady = false;
       if(currentView.primary() == this.address()) {
-        send(new Ping(currentView.viewNum()), viewServer);
         startBackupInit();
+        if (currentView.backup() == null) {
+          send(new Ping(currentView.viewNum()), viewServer);
+        }
       } 
     }
   }
@@ -91,7 +93,11 @@ class PBServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void onPingTimer(PingTimer t) {
     // Your code here...
-    send(new Ping(currentView.viewNum()), viewServer);
+    if (currentView.primary() == this.address() && currentView.backup() != null && !backupReady) {
+      send(new Ping(currentView.viewNum() - 1), viewServer);
+    } else {
+      send(new Ping(currentView.viewNum()), viewServer);
+    }
     set(t, PING_MILLIS);
   }
 
@@ -134,16 +140,29 @@ class PBServer extends Node {
   private void handlePBInitRequest(PBInitRequest m, Address sender) {
     if(currentView.viewNum() != m.viewNum()) {
       send(new PBInitReply(currentView.viewNum(), null), sender);
+      if(currentView.viewNum() < m.viewNum()) {
+        // sending a new ping as my view is old
+        send(new Ping(currentView.viewNum()), viewServer);
+      }
       return;
     }
     AMOResult result = app.execute(m.command());
     send(new PBInitReply(currentView.viewNum(), result), sender);
   }
-  // TODO: What if an old reply comes? 
   private void handlePBInitReply(PBInitReply m, Address sender) {
-    if(m.viewNum() == currentView.viewNum() && m.result() != null) {
-      backupReady = true;
-      set(new PBCommandTimer(currentView.viewNum()), PB_COMMAND_MILLIS);
+    if(m.viewNum() > currentView.viewNum()) {
+      // send Ping to viewserver
+      send(new Ping(currentView.viewNum()), viewServer);
+    } else if(m.viewNum() < currentView.viewNum() || m.result() == null) {
+      // TODO: send the command again
+      return;
+    } else {
+      if(m.viewNum() == currentView.viewNum() && m.result() != null) {
+        backupReady = true;
+        send(new Ping(currentView.viewNum()), viewServer);
+        sendNextPBCommand();
+        set(new PBCommandTimer(currentView.viewNum()), PB_COMMAND_MILLIS);
+      }
     }
   }
 
@@ -152,7 +171,7 @@ class PBServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void sendNextPBCommand() {
     AMOCommand c = clientRequests.peek();
-    if(c != null) {
+    if(c != null && currentView != null && currentView.backup() != null) {
       send(new PBCommandRequest(currentView.viewNum(), c), currentView.backup());
     }
   }
@@ -166,6 +185,9 @@ class PBServer extends Node {
   private void handlePBCommandRequest(PBCommandRequest m, Address sender) {
     if(currentView.viewNum() != m.viewNum()) {
       send(new PBCommandReply(currentView.viewNum(), null, null), sender);
+      if(currentView.viewNum() < m.viewNum()) {
+        send(new Ping(currentView.viewNum()), viewServer);
+      }
       return;
     }
     AMOResult result = app.execute(m.command());
@@ -173,14 +195,17 @@ class PBServer extends Node {
   }
 
   private void handlePBCommandReply(PBCommandReply m, Address sender) {
-    if(m.viewNum() == currentView.viewNum()) {
-      if(m.result() == null) return;
+    if(m.viewNum() > currentView.viewNum()) {
+      send(new Ping(currentView.viewNum()), viewServer);
+    } else if(m.viewNum() < currentView.viewNum() || m.result() == null) {
+      sendNextPBCommand();
+    } else {
       AMOCommand c = clientRequests.peek();
       if (!Objects.equal(c, m.command())) return;
       clientRequests.remove();
       send(new CSReply(currentView.viewNum(), m.result()), c.address());
       sendNextPBCommand();
-    } 
+    }
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -191,6 +216,9 @@ class PBServer extends Node {
   private void handleCSRequest(CSRequest m, Address sender) {
     if(m.viewNum() != currentView.viewNum()) {
       send(new CSReply(currentView.viewNum(), null), sender);
+      if(currentView.viewNum() < m.viewNum()) {
+        send(new Ping(currentView.viewNum()), viewServer);
+      }
       return;
     }
 
@@ -200,6 +228,7 @@ class PBServer extends Node {
       return;
     }
     clientRequests.add((AMOCommand)m.command());
+    sendNextPBCommand();
   }
 
 

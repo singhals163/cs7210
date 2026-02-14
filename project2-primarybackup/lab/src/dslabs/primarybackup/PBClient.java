@@ -77,21 +77,35 @@ class PBClient extends Node implements Client {
     // Your code here...
     
   }
-
+  private void retryCommand() {
+    if (currentCommand != null && result == null && currentView != null && currentView.primary() != null) {
+        send(new CSRequest(currentView.viewNum(), currentCommand), currentView.primary());
+    }
+  }
   private synchronized void handleViewReply(ViewReply m, Address sender) {
     // Your code here...
-    currentView = m.view();
+    View newView = m.view();
+    if (currentView == null || newView.viewNum() > currentView.viewNum()) {
+        currentView = newView;
+        retryCommand();
+    }
   }
 
   // Your code here...
   private synchronized void handleCSReply(CSReply m, Address sender) {
-    if(m.viewNum() != currentView.viewNum() || m.result() == null) return;
-    AMOResult res = (AMOResult)(m.result());
-    if(currentCommand != null && res.sequenceNumber() != sequenceNum) {
-      return;
+    if(m.viewNum() > currentView.viewNum()) {
+      // send getView to viewserver
+      send(new GetView(), viewServer);
+    } else if(m.viewNum() < currentView.viewNum() || m.result() == null) {
+      // send the command again
+      retryCommand();
+    } else {
+      AMOResult res = (AMOResult)(m.result());
+      if(currentCommand != null && result == null && res.sequenceNumber() == sequenceNum) {
+        this.result = res.result();
+        notify();
+      }
     }
-    this.result = res.result();
-    notify();
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -100,9 +114,7 @@ class PBClient extends Node implements Client {
   private synchronized void onClientTimer(ClientTimer t) {
     // Your code here...
     if(Objects.equal(currentCommand, t.command()) && result == null) {
-      if(currentView != null && currentView.primary() != null) {
-        send(new CSRequest(currentView.viewNum(), currentCommand), currentView.primary());
-      } 
+      retryCommand();
       set(new ClientTimer(currentCommand), ClientTimer.CLIENT_RETRY_MILLIS);
     }
   }
