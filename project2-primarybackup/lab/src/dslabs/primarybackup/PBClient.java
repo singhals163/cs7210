@@ -17,7 +17,7 @@ class PBClient extends Node implements Client {
   private final Address viewServer;
 
   // Your code here...
-  private Request request;
+  private AMOCommand currentCommand;
   private Result result;
   private View currentView;
   private int sequenceNum = 0;
@@ -43,19 +43,17 @@ class PBClient extends Node implements Client {
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
-    if(currentView == null || currentView.primary() == null) {
-      return;
-    } 
-    if(command instanceof Get || command instanceof Put || command instanceof Append) {
-      sequenceNum++;
-      AMOCommand amoCommand = new AMOCommand(command, sequenceNum, this.address());
-
-      request = new CSRequest(currentView.viewNum(), amoCommand);
-      send(request, currentView.primary());
-      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS);
-    } else {
+    if(!(command instanceof Get || command instanceof Put || command instanceof Append)) {
       throw new IllegalArgumentException();
     }
+    sequenceNum++;
+    currentCommand = new AMOCommand(command, sequenceNum, this.address());
+    result = null;
+    set(new ClientTimer(currentCommand), ClientTimer.CLIENT_RETRY_MILLIS);
+    
+    if(currentView != null && currentView.primary() != null) {
+      send(new CSRequest(currentView.viewNum(), currentCommand), currentView.primary());
+    } 
   }
 
   @Override
@@ -89,7 +87,7 @@ class PBClient extends Node implements Client {
   private synchronized void handleCSReply(CSReply m, Address sender) {
     if(m.viewNum() != currentView.viewNum() || m.result() == null) return;
     AMOResult res = (AMOResult)(m.result());
-    if(request != null && res.sequenceNumber() != sequenceNum) {
+    if(currentCommand != null && res.sequenceNumber() != sequenceNum) {
       return;
     }
     this.result = res.result();
@@ -101,10 +99,11 @@ class PBClient extends Node implements Client {
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void onClientTimer(ClientTimer t) {
     // Your code here...
-    if(Objects.equal(request, t.request()) && result == null) {
-      this.request = new CSRequest(currentView.viewNum(), this.request.command());
-      send(request, currentView.primary());
-      set(new ClientTimer(request), ClientTimer.CLIENT_RETRY_MILLIS);
+    if(Objects.equal(currentCommand, t.command()) && result == null) {
+      if(currentView != null && currentView.primary() != null) {
+        send(new CSRequest(currentView.viewNum(), currentCommand), currentView.primary());
+      } 
+      set(new ClientTimer(currentCommand), ClientTimer.CLIENT_RETRY_MILLIS);
     }
   }
 

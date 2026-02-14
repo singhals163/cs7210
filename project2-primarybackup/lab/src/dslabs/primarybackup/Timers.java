@@ -2,6 +2,7 @@ package dslabs.primarybackup;
 
 import dslabs.framework.Timer;
 import lombok.Data;
+import dslabs.framework.Command;
 
 @Data
 final class PingCheckTimer implements Timer {
@@ -18,7 +19,7 @@ final class ClientTimer implements Timer {
   static final int CLIENT_RETRY_MILLIS = 100;
 
   // Your code here...
-  private final Request request;
+  private final Command command;
 }
 
 // Your code here...

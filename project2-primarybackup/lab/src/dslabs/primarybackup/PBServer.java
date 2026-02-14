@@ -186,10 +186,11 @@ class PBServer extends Node {
   private void handleCSRequest(CSRequest m, Address sender) {
     if(m.viewNum() != currentView.viewNum()) {
       send(new CSReply(currentView.viewNum(), null), sender);
+      return;
     }
 
     AMOResult result = app.execute(m.command());
-    if(m.command() instanceof Get || currentView.backup() == null) {
+    if(((AMOCommand)m.command()).command() instanceof Get || currentView.backup() == null) {
       send(new CSReply(currentView.viewNum(), result), sender);
       return;
     }

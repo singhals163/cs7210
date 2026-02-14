@@ -5,6 +5,7 @@ import dslabs.framework.Message;
 import dslabs.framework.Result;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
+import lombok.ToString;
 
 /* -----------------------------------------------------------------------------------------------
  *  ViewServer Messages
@@ -40,7 +41,7 @@ class Reply implements Message {
 }
 
 // Your code here...
-
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class PBCommandRequest extends Request {
@@ -49,6 +50,7 @@ class PBCommandRequest extends Request {
   }
 }
 
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class PBCommandReply extends Reply {
@@ -59,6 +61,7 @@ class PBCommandReply extends Reply {
     }
 }
 
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class PBInitRequest extends Request {
@@ -67,6 +70,7 @@ class PBInitRequest extends Request {
   }
 }
 
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class PBInitReply extends Reply {
@@ -75,6 +79,7 @@ class PBInitReply extends Reply {
     }
 }
 
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class CSRequest extends Request {
@@ -83,6 +88,7 @@ class CSRequest extends Request {
   }
 }
 
+@ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
 class CSReply extends Reply {
