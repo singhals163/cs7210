@@ -128,7 +128,7 @@ class ViewServer extends Node {
     Address newPrimary = currentPrimary;
     Address newBackup = currentBackup;
 
-    if (!isAlive(currentPrimary)) {
+    if (!isAlive(currentPrimary) && isAlive(currentBackup)) {
       newPrimary = currentBackup; 
       newBackup = null; 
     }
