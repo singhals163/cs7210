@@ -26,6 +26,7 @@ class PBServer extends Node {
   private View currentView;
   private final AMOApplication<Application> app;
   private Queue<AMOCommand> clientRequests = new LinkedList<>(); 
+  private int sequenceNum = 0;
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -91,8 +92,9 @@ class PBServer extends Node {
   private void startBackupInit() {
     // If currentView has a backup, send a generateInitCommand to the backup
     if(currentView.backup() != null && backupReady == false) {
-      AMOResult result = app.execute(new AMOCommand(new GetInit(), 1, this.address()));
-      AMOCommand command = new AMOCommand(new Init(((GetInitResult)result.result()).store()), 1, this.address());
+      sequenceNum++;
+      AMOResult result = app.execute(new AMOCommand(new GetInit(), sequenceNum, this.address()));
+      AMOCommand command = new AMOCommand(new Init(((GetInitResult)result.result()).store()), sequenceNum, this.address());
       PBInitRequest req = new PBInitRequest(currentView.viewNum(), command);
       send(req, currentView.backup());
       set(new InitTimer(currentView.viewNum(), req), INIT_MILLIS);
@@ -146,7 +148,7 @@ class PBServer extends Node {
 
   private void sendNextPBCommand() {
     AMOCommand c = clientRequests.peek();
-    if(c != null && currentView != null && currentView.backup() != null) {
+    if(c != null && currentView != null && currentView.backup() != null && backupReady) {
       send(new PBCommandRequest(currentView.viewNum(), c), currentView.backup());
     }
   }
@@ -204,3 +206,14 @@ class PBServer extends Node {
     sendNextPBCommand();
   }
 }
+
+
+// TODO: 
+// failing reason is that while backup is initializing, an old request from a client might come up and get 
+// added to the queue, and then it will be sent to the backup server, and backup will execute because it has
+// no history of the commands that are already executed. This causes a command to run twice on backup creating
+// inconsistency in the results of the primary and backup
+// 
+// 
+// 
+// 
