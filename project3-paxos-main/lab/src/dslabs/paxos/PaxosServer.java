@@ -7,6 +7,19 @@ import dslabs.framework.Node;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
+import com.google.common.base.Objects;
+import dslabs.framework.Address;
+import dslabs.framework.Application;
+import dslabs.framework.Node;
+import lombok.EqualsAndHashCode;
+import lombok.ToString;
+import dslabs.atmostonce.AMOApplication;
+import java.util.Queue;
+import java.net.Authenticator.RequestorType;
+import java.util.LinkedList;
+import dslabs.atmostonce.*;
+import dslabs.kvstore.KVStore.*;
+
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 public class PaxosServer extends Node {
@@ -14,6 +27,14 @@ public class PaxosServer extends Node {
   private final Address[] servers;
 
   // Your code here...
+  private final AMOApplication<Application> app;
+  // states
+  // 0: startup
+  // 1: not registered
+  // 2: follower
+  // 3: leader
+  private int state;
+  private Address leader;
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -23,11 +44,18 @@ public class PaxosServer extends Node {
     this.servers = servers;
 
     // Your code here...
+    // Initialize the application
+    this.app = new AMOApplication<>(app);
+    // The current state of the server is Fresh
   }
-
+  
   @Override
   public void init() {
     // Your code here...
+    // Find the current leader
+    // Get the current status of the logs from the leader
+    // Initialize the logs
+
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -112,6 +140,14 @@ public class PaxosServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
   private void handlePaxosRequest(PaxosRequest m, Address sender) {
     // Your code here...
+    if(state == 0 || state == 1) {
+      // don't do anything 
+    } else if (state == 2) {
+      // send the reply to the client saying that I'm not the leader and also the current leader
+    } else {
+      // add the request to the next available log and send the logging request to the followers
+      // once we receive a reply from the majority, send the response to the client
+    }
   }
 
   // Your code here...
