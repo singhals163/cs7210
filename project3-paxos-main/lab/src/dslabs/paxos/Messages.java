@@ -21,6 +21,9 @@ final class AppendEntries implements Message {
     private final int prevLogTerm;
     private final List<RaftLogEntry> entries;
     private final int leaderCommit;
+    
+    // NEW: Leader tells followers what is safe to delete
+    private final int globalFirstNonCleared; 
 }
 
 @Data
@@ -28,6 +31,9 @@ final class AppendEntriesReply implements Message {
     private final int term;
     private final boolean success;
     private final int matchIndex;
+    
+    // NEW: Follower tells leader how much it has executed
+    private final int lastApplied; 
 }
 
 @Data

@@ -17,7 +17,6 @@ public final class PaxosClient extends Node implements Client {
     private int sequenceNum = 1;
     private AMOCommand pendingCommand;
     private AMOResult result;
-    private Address knownLeader;
 
     public PaxosClient(Address address, Address[] servers) {
         super(address);
@@ -31,13 +30,7 @@ public final class PaxosClient extends Node implements Client {
     public synchronized void sendCommand(Command operation) {
         pendingCommand = new AMOCommand(operation, address(), sequenceNum);
         result = null;
-        PaxosRequest request = new PaxosRequest(pendingCommand);
-        
-        if (knownLeader != null) {
-            send(request, knownLeader);
-        } else {
-            broadcast(request);
-        }
+        broadcast(new PaxosRequest(pendingCommand));
         set(new ClientTimer(pendingCommand), ClientTimer.CLIENT_RETRY_MILLIS);
     }
 
@@ -58,11 +51,7 @@ public final class PaxosClient extends Node implements Client {
         if (result != null) return; 
 
         if (!m.isLeader()) {
-            if (m.leaderId() != null) {
-                knownLeader = m.leaderId();
-                send(new PaxosRequest(pendingCommand), knownLeader);
-            }
-            return;
+            return; // Ignore redirects, let the timer handle retries safely
         }
         
         AMOResult amoResult = m.result();
