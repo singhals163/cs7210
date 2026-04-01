@@ -6,6 +6,8 @@ import dslabs.framework.Result;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
+import dslabs.atmostonce.AMOApplication;
+import dslabs.framework.Application;
 
 /* -----------------------------------------------------------------------------------------------
  *  ViewServer Messages
@@ -64,24 +66,6 @@ class PBCommandReply extends Reply {
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 @Data
-class PBInitRequest extends Request {
-  public PBInitRequest(int viewNum, Command command) {
-    super(viewNum, command);
-  }
-}
-
-@ToString(callSuper = true)
-@EqualsAndHashCode(callSuper = true)
-@Data
-class PBInitReply extends Reply {
-  public PBInitReply(int viewNum, Result result) {
-        super(viewNum, result);
-    }
-}
-
-@ToString(callSuper = true)
-@EqualsAndHashCode(callSuper = true)
-@Data
 class CSRequest extends Request {
   public CSRequest(int viewNum, Command command) {
     super(viewNum, command);
@@ -95,4 +79,19 @@ class CSReply extends Reply {
   public CSReply(int viewNum, Result result) {
         super(viewNum, result);
     }
+}
+
+@Data
+class PBInitRequest implements Message {
+  private final int viewNum;
+  private final AMOApplication<Application> amoApp;
+}
+
+@Data
+class PBInitReply implements Message {
+  private final int viewNum;
+  // You don't need a Result field here anymore. 
+  // If the backup replies with this message, it implies success.
+
+  private final Result result;
 }

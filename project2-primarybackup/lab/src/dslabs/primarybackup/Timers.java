@@ -27,7 +27,7 @@ final class ClientTimer implements Timer {
 final class InitTimer implements Timer {
   static final int INIT_MILLIS = 25;
   final int viewNum;
-  final Request request;
+  final PBInitRequest request;
 }
 
 @Data

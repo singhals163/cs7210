@@ -23,10 +23,10 @@ class PBServer extends Node {
 
   // Your code here...
   private boolean backupReady;
+  private boolean backupStateInitialized;
   private View currentView;
-  private final AMOApplication<Application> app;
+  private AMOApplication<Application> app;
   private Queue<AMOCommand> clientRequests = new LinkedList<>(); 
-  private int sequenceNum = 0;
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -37,6 +37,7 @@ class PBServer extends Node {
 
     // Your code here...
     backupReady = false;
+    backupStateInitialized = false;
     currentView = new View(ViewServer.STARTUP_VIEWNUM, null, null);
     this.app = new AMOApplication<>(app);
   }
@@ -58,6 +59,7 @@ class PBServer extends Node {
     if(currentView.viewNum() < reply.viewNum()) {
       currentView = reply;
       backupReady = false;
+      backupStateInitialized = false;
       if(currentView.primary() == this.address()) {
         startBackupInit();
         if (currentView.backup() == null) {
@@ -90,12 +92,8 @@ class PBServer extends Node {
    * ---------------------------------------------------------------------------------------------*/
  
   private void startBackupInit() {
-    // If currentView has a backup, send a generateInitCommand to the backup
     if(currentView.backup() != null && backupReady == false) {
-      sequenceNum++;
-      AMOResult result = app.execute(new AMOCommand(new GetInit(), sequenceNum, this.address()));
-      AMOCommand command = new AMOCommand(new Init(((GetInitResult)result.result()).store()), sequenceNum, this.address());
-      PBInitRequest req = new PBInitRequest(currentView.viewNum(), command);
+      PBInitRequest req = new PBInitRequest(currentView.viewNum(), this.app);
       send(req, currentView.backup());
       set(new InitTimer(currentView.viewNum(), req), INIT_MILLIS);
     }
@@ -121,8 +119,11 @@ class PBServer extends Node {
       }
       return;
     }
-    AMOResult result = app.execute(m.command());
-    send(new PBInitReply(currentView.viewNum(), result), sender);
+    if(!backupStateInitialized) {
+      this.app = m.amoApp();
+      backupStateInitialized = true;
+    }
+    send(new PBInitReply(currentView.viewNum(), new AMOResult(0, null)), sender);
   }
   
   private void handlePBInitReply(PBInitReply m, Address sender) {

@@ -60,21 +60,6 @@ public class KVStore implements Application {
   }
 
   // Your code here...
-  @Data
-  public static final class Init implements KVStoreCommand {
-    @NonNull private final Map<String, String> store;
-  }
-
-  @Data
-  public static final class GetInit implements KVStoreCommand {}
-
-  @Data
-  public static final class InitOK implements KVStoreResult {}
-
-  @Data
-  public static final class GetInitResult implements KVStoreResult {
-    @NonNull private final Map<String, String> store;
-  }
 
   private Map<String, String> store = new HashMap<>();
 
@@ -107,20 +92,6 @@ public class KVStore implements Application {
       return new AppendResult(value);
     }
 
-    if (command instanceof Init) {
-      Init i = (Init) command;
-      store = i.store;
-      return new InitOK();
-    }
-
-    if (command instanceof GetInit) {
-      return new GetInitResult(store);
-    }
-
     throw new IllegalArgumentException();
-  }
-
-  public Init generateInitCommand() {
-    return new Init(store);
   }
 }
