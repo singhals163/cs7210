@@ -1,5 +1,6 @@
 package dslabs.atmostonce;
 
+import dslabs.framework.Address;
 import dslabs.framework.Application;
 import dslabs.framework.Command;
 import dslabs.framework.Result;
@@ -17,7 +18,6 @@ import lombok.ToString;
 public final class AMOApplication<T extends Application> implements Application {
     @Getter @NonNull private final T application;
     
-    // Tracks the highest executed sequence number and its result per client
     private final Map<Address, AMOResult> executedCommands = new HashMap<>();
 
     @Override
