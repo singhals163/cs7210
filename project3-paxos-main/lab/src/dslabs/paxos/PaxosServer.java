@@ -18,7 +18,10 @@ public class PaxosServer extends Node {
     private final Address[] servers;
     private final AMOApplication<Application> app;
 
-    private enum Role { FOLLOWER, CANDIDATE, LEADER }
+    private enum Role {
+        FOLLOWER, CANDIDATE, LEADER
+    }
+
     private Role role = Role.FOLLOWER;
     private Address currentLeaderId = null;
 
@@ -80,7 +83,8 @@ public class PaxosServer extends Node {
     }
 
     private void onElectionTimer(ElectionTimer t) {
-        if (role == Role.LEADER) return;
+        if (role == Role.LEADER)
+            return;
 
         role = Role.CANDIDATE;
         currentTerm++;
@@ -113,9 +117,9 @@ public class PaxosServer extends Node {
 
         int lastLogIndex = raftLog.size() - 1;
         int lastLogTerm = raftLog.get(lastLogIndex).term();
-        
+
         boolean logIsUpToDate = (m.lastLogTerm() > lastLogTerm) ||
-            (m.lastLogTerm() == lastLogTerm && m.lastLogIndex() >= lastLogIndex);
+                (m.lastLogTerm() == lastLogTerm && m.lastLogIndex() >= lastLogIndex);
 
         if ((votedFor == null || votedFor.equals(sender)) && logIsUpToDate) {
             votedFor = sender;
@@ -127,7 +131,8 @@ public class PaxosServer extends Node {
     }
 
     private void handleRequestVoteReply(RequestVoteReply m, Address sender) {
-        if (role != Role.CANDIDATE) return;
+        if (role != Role.CANDIDATE)
+            return;
 
         if (m.term() > currentTerm) {
             currentTerm = m.term();
@@ -153,10 +158,12 @@ public class PaxosServer extends Node {
     }
 
     private void broadcastAppendEntries() {
-        if (role != Role.LEADER) return;
+        if (role != Role.LEADER)
+            return;
 
         for (Address server : servers) {
-            if (server.equals(address())) continue;
+            if (server.equals(address()))
+                continue;
 
             int nextIdx = nextIndex.get(server);
             int prevLogIndex = nextIdx - 1;
@@ -168,8 +175,7 @@ public class PaxosServer extends Node {
             }
 
             AppendEntries ae = new AppendEntries(
-                currentTerm, address(), prevLogIndex, prevLogTerm, entriesToSend, commitIndex
-            );
+                    currentTerm, address(), prevLogIndex, prevLogTerm, entriesToSend, commitIndex);
             send(ae, server);
         }
     }
@@ -190,7 +196,7 @@ public class PaxosServer extends Node {
         resetElectionTimer();
 
         if (raftLog.size() - 1 < m.prevLogIndex() ||
-            raftLog.get(m.prevLogIndex()).term() != m.prevLogTerm()) {
+                raftLog.get(m.prevLogIndex()).term() != m.prevLogTerm()) {
             send(new AppendEntriesReply(currentTerm, false, raftLog.size()), sender);
             return;
         }
@@ -209,8 +215,11 @@ public class PaxosServer extends Node {
         }
 
         if (m.leaderCommit() > commitIndex) {
-            commitIndex = Math.min(m.leaderCommit(), m.prevLogIndex() + m.entries().size());
-            applyCommitted();
+            int potentialCommit = Math.min(m.leaderCommit(), m.prevLogIndex() + m.entries().size());
+            if (potentialCommit > commitIndex) {
+                commitIndex = potentialCommit;
+                applyCommitted();
+            }
         }
 
         int highestAppendedIndex = m.prevLogIndex() + m.entries().size();
@@ -218,7 +227,8 @@ public class PaxosServer extends Node {
     }
 
     private void handleAppendEntriesReply(AppendEntriesReply m, Address sender) {
-        if (role != Role.LEADER) return;
+        if (role != Role.LEADER)
+            return;
 
         if (m.term() > currentTerm) {
             currentTerm = m.term();
@@ -229,22 +239,23 @@ public class PaxosServer extends Node {
         }
 
         if (m.success()) {
-            matchIndex.put(sender, m.matchIndex());
-            nextIndex.put(sender, m.matchIndex() + 1);
-            advanceCommitIndex();
+            if (m.matchIndex() > matchIndex.get(sender)) {
+                matchIndex.put(sender, m.matchIndex());
+                nextIndex.put(sender, m.matchIndex() + 1);
+                advanceCommitIndex();
+            }
         } else {
             int backtrackedIndex = m.matchIndex();
             if (backtrackedIndex < nextIndex.get(sender)) {
                 nextIndex.put(sender, Math.max(1, backtrackedIndex));
-            } else {
-                nextIndex.put(sender, nextIndex.get(sender) - 1);
             }
         }
     }
 
     private void advanceCommitIndex() {
         for (int n = raftLog.size() - 1; n > commitIndex; n--) {
-            if (raftLog.get(n).term() != currentTerm) continue;
+            if (raftLog.get(n).term() != currentTerm)
+                continue;
 
             int matchCount = 1;
             for (Address server : servers) {
@@ -269,7 +280,7 @@ public class PaxosServer extends Node {
 
         raftLog.add(new RaftLogEntry(currentTerm, m.command()));
         int newEntryIndex = raftLog.size() - 1;
-        
+
         matchIndex.put(address(), newEntryIndex);
         nextIndex.put(address(), newEntryIndex + 1);
 
