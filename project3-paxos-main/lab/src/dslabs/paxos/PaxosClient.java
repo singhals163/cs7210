@@ -1,5 +1,7 @@
 package dslabs.paxos;
 
+import dslabs.atmostonce.AMOCommand;
+import dslabs.atmostonce.AMOResult;
 import dslabs.framework.Address;
 import dslabs.framework.Client;
 import dslabs.framework.Command;
@@ -11,54 +13,73 @@ import lombok.ToString;
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 public final class PaxosClient extends Node implements Client {
-  private final Address[] servers;
+    private final Address[] servers;
+    private int sequenceNum = 1;
+    private AMOCommand pendingCommand;
+    private AMOResult result;
 
-  // Your code here...
+    public PaxosClient(Address address, Address[] servers) {
+        super(address);
+        this.servers = servers;
+    }
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Construction and Initialization
-   * ---------------------------------------------------------------------------------------------*/
-  public PaxosClient(Address address, Address[] servers) {
-    super(address);
-    this.servers = servers;
-  }
+    @Override
+    public synchronized void init() { }
 
-  @Override
-  public synchronized void init() {
-    // No need to initialize
-  }
+    @Override
+    public synchronized void sendCommand(Command operation) {
+        pendingCommand = new AMOCommand(operation, address(), sequenceNum);
+        result = null;
+        PaxosRequest request = new PaxosRequest(pendingCommand);
+        broadcast(request);
+        set(new ClientTimer(pendingCommand), ClientTimer.CLIENT_RETRY_MILLIS);
+    }
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Client Methods
-   * ---------------------------------------------------------------------------------------------*/
-  @Override
-  public synchronized void sendCommand(Command operation) {
-    // Your code here...
-  }
+    @Override
+    public synchronized boolean hasResult() {
+        return result != null;
+    }
 
-  @Override
-  public synchronized boolean hasResult() {
-    // Your code here...
-    return false;
-  }
+    @Override
+    public synchronized Result getResult() throws InterruptedException {
+        while (result == null) {
+            wait();
+        }
+        return result.result();
+    }
 
-  @Override
-  public synchronized Result getResult() throws InterruptedException {
-    // Your code here...
-    return null;
-  }
+    private synchronized void handlePaxosReply(PaxosReply m, Address sender) {
+        if (result != null) return; 
 
-  /* -----------------------------------------------------------------------------------------------
-   * Message Handlers
-   * ---------------------------------------------------------------------------------------------*/
-  private synchronized void handlePaxosReply(PaxosReply m, Address sender) {
-    // Your code here...
-  }
+        // Check if this is a redirection message
+        if (!m.isLeader()) {
+            if (m.leaderId() != null) {
+                // Update our known leader and try sending directly to them immediately
+                knownLeader = m.leaderId();
+                send(new PaxosRequest(pendingCommand), knownLeader);
+            }
+            return;
+        }
+        
+        // Handle successful execution
+        AMOResult amoResult = m.result();
+        if (amoResult != null && amoResult.sequenceNum() == sequenceNum) {
+            result = amoResult;
+            sequenceNum++;
+            notifyAll();
+        }
+    }
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Timer Handlers
-   * ---------------------------------------------------------------------------------------------*/
-  private synchronized void onClientTimer(ClientTimer t) {
-    // Your code here...
-  }
+    private synchronized void onClientTimer(ClientTimer t) {
+        if (result == null && t.command().equals(pendingCommand)) {
+            broadcast(new PaxosRequest(pendingCommand));
+            set(t, ClientTimer.CLIENT_RETRY_MILLIS);
+        }
+    }
+
+    private void broadcast(PaxosRequest request) {
+        for (Address server : servers) {
+            send(request, server);
+        }
+    }
 }
