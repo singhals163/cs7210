@@ -26,12 +26,10 @@ public final class ShardMaster implements Application {
   private Map<Integer, Map<Integer, Pair<Set<Address>, Set<Integer>>>> configs;
   private Map<Integer, Integer> shardToGroupId;
   private int currentConfigNum;
-  private int totalGroups;
 
   public ShardMaster(int numShards) {
     this.numShards = numShards;
     this.currentConfigNum = -1;
-    this.totalGroups = 0;
     this.configs = new HashMap<>();
     this.shardToGroupId = new HashMap<>();
   }
@@ -85,13 +83,59 @@ public final class ShardMaster implements Application {
     private final Map<Integer, Pair<Set<Address>, Set<Integer>>> groupInfo;
   }
 
+  // =========================================================
+  // HELPER METHOD: Deep Copy the Configuration
+  // =========================================================
+  private Map<Integer, Pair<Set<Address>, Set<Integer>>> deepCopyConfig(
+      Map<Integer, Pair<Set<Address>, Set<Integer>>> oldConfig) {
+
+    Map<Integer, Pair<Set<Address>, Set<Integer>>> newConfig = new HashMap<>();
+
+    for (Map.Entry<Integer, Pair<Set<Address>, Set<Integer>>> entry : oldConfig.entrySet()) {
+      Integer groupId = entry.getKey();
+      // Create brand new sets so we don't mutate the old config's sets
+      Set<Address> copiedServers = new HashSet<>(entry.getValue().getLeft());
+      Set<Integer> copiedShards = new HashSet<>(entry.getValue().getRight());
+
+      newConfig.put(groupId, Pair.of(copiedServers, copiedShards));
+    }
+    return newConfig;
+  }
+
+  private void balanceConfig() {
+    Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig = configs.get(currentConfigNum);
+    while (true) {
+      // move one shard from the largest to the smallest if difference is greater than 1
+      Integer largestShard = -1, largestShardSize = 0, smallestShard = -1, smallestShardSize = numShards + 1;
+      for (var entry : currentConfig.entrySet()) {
+        Integer key = entry.getKey();
+        var value = entry.getValue();
+        if(value.getRight().size() < smallestShardSize) {
+          smallestShardSize = value.getRight().size();
+          smallestShard = key;
+        }
+        if(value.getRight().size() > largestShardSize) {
+          largestShardSize = value.getRight().size();
+          largestShard = key;
+        }
+      }
+      if(largestShardSize - smallestShardSize <= 1) {
+        break;
+      }
+      Integer moveShard = currentConfig.get(largestShard).getRight().iterator().next();
+      shardToGroupId.put(moveShard, smallestShard);
+      currentConfig.get(largestShard).getRight().remove(moveShard);
+      currentConfig.get(smallestShard).getRight().add(moveShard);
+    }
+    return;
+  }
+
   @Override
   public Result execute(Command command) {
     if (command instanceof Join) {
       Join join = (Join) command;
 
       // Your code here...
-      totalGroups++;
       if (currentConfigNum == -1) {
         // create the first config
         currentConfigNum = INITIAL_CONFIG_NUM;
@@ -100,93 +144,89 @@ public final class ShardMaster implements Application {
           shardToGroupId.put(i, join.groupId());
           currentShardSet.add(i);
         }
-        Map<Integer, Pair<Set<Address>, Set<Integer>>> groupInfo = new HashMap<>();
-        groupInfo.put(join.groupId(), Pair.of(join.servers(), currentShardSet));
-        configs.put(currentConfigNum, groupInfo);
+        Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig = new HashMap<>();
+        currentConfig.put(join.groupId(), Pair.of(join.servers(), currentShardSet));
+        configs.put(currentConfigNum, currentConfig);
         return new Ok();
       } else {
-        // rebalance configs
-        Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig = configs.get(currentConfigNum);
-        if (currentConfig.containsKey(join.groupId())) {
+        Map<Integer, Pair<Set<Address>, Set<Integer>>> newConfig = deepCopyConfig(configs.get(currentConfigNum));
+
+        if (newConfig.containsKey(join.groupId())) {
           return new Error();
         }
         currentConfigNum++;
 
-        // create a priority_queue of the number of shards each group is maintaining
-        // pop the top and decrease their number one, give one shard from that group to
-        // the new group
-        // push the group back in the priority_queue
-        // keep doing till we find that the top of priority_queue = size of the new
-        // group
-        PriorityQueue<Pair<Integer, Integer>> pq = new PriorityQueue<>(
-            (a, b) -> b.getLeft().compareTo(a.getLeft()));
-        currentConfig.forEach((key, value) -> {
-          pq.add(Pair.of(value.getRight().size(), key));
-        });
-        Set<Integer> movedShards = new HashSet<>();
-        while (!pq.isEmpty()) {
-          Pair<Integer, Integer> donorGroup = pq.poll();
-          if (donorGroup.getLeft() - movedShards.size() <= 1 || donorGroup.getLeft() == 1) {
-            break;
-          }
-          Integer movedShard = currentConfig.get(donorGroup.getRight()).getRight().iterator().next();
-          shardToGroupId.put(movedShard, join.groupId());
-          currentConfig.get(donorGroup.getRight()).getRight().remove(movedShard);
-          movedShards.add(movedShard);
-          pq.add(Pair.of(donorGroup.getLeft() - 1, donorGroup.getRight()));
-        }
-        currentConfig.put(join.groupId(), Pair.of(join.servers(), movedShards));
-        configs.put(currentConfigNum, currentConfig);
+        // Add the new group with empty shards and rebalance
+        Set<Integer> newGroupShards = new HashSet<>();
+        newConfig.put(join.groupId(), Pair.of(join.servers(), newGroupShards));
+        configs.put(currentConfigNum, newConfig);
+        balanceConfig();
         return new Ok();
       }
-
     }
 
     if (command instanceof Leave) {
       Leave leave = (Leave) command;
 
-      // Your code here...
       if (currentConfigNum == -1) {
         return new Error();
       }
-      Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig = configs.get(currentConfigNum);
-      if (!currentConfig.containsKey(leave.groupId())) {
+
+      Map<Integer, Pair<Set<Address>, Set<Integer>>> newConfig = deepCopyConfig(configs.get(currentConfigNum));
+
+      if (!newConfig.containsKey(leave.groupId())) {
         return new Error();
       }
       currentConfigNum++;
 
-      // make a pq, this time in ascending order, and keep insering element to the
-      // top.
+      Set<Integer> moveShards = newConfig.remove(leave.groupId()).getRight();
 
-      PriorityQueue<Pair<Integer, Integer>> pq = new PriorityQueue<>(
-          (a, b) -> a.getLeft().compareTo(b.getLeft()));
-      currentConfig.forEach((key, value) -> {
-        if(key != leave.groupId()) {
-          pq.add(Pair.of(value.getRight().size(), key));
+      // Rebalance using PriorityQueue (Min-Heap)
+      if (!newConfig.isEmpty()) {
+        PriorityQueue<Pair<Integer, Integer>> pq = new PriorityQueue<>(
+            (a, b) -> a.getLeft().compareTo(b.getLeft()));
+
+        for (Map.Entry<Integer, Pair<Set<Address>, Set<Integer>>> entry : newConfig.entrySet()) {
+          pq.add(Pair.of(entry.getValue().getRight().size(), entry.getKey()));
         }
-      });
-      Set<Integer> moveShards = currentConfig.get(leave.groupId()).getRight();
-      for(Integer shard:moveShards) {
-        Pair<Integer, Integer> receiverGroup = pq.poll();
-        pq.add(Pair.of(receiverGroup.getLeft()+1, receiverGroup.getRight()));
-        shardToGroupId.put(shard, receiverGroup.getRight());
-        currentConfig.get(receiverGroup.getRight()).getRight().add(shard);
+
+        for (Integer shard : moveShards) {
+          Pair<Integer, Integer> receiverGroup = pq.poll();
+          newConfig.get(receiverGroup.getRight()).getRight().add(shard);
+          shardToGroupId.put(shard, receiverGroup.getRight());
+          pq.add(Pair.of(receiverGroup.getLeft() + 1, receiverGroup.getRight()));
+        }
+      } else {
+        // If there are no groups left, clear the shard mappings
+        shardToGroupId.clear();
       }
-      currentConfig.remove(leave.groupId());
-      configs.put(currentConfigNum, currentConfig);
+
+      configs.put(currentConfigNum, newConfig);
+      balanceConfig();
       return new Ok();
     }
 
     if (command instanceof Move) {
       Move move = (Move) command;
 
-      // Your code here...
-      Integer oldGroupID = shardToGroupId.get(move.shardNum());
-      Integer newGroupID = move.shardNum();
-      if (oldGroupID == newGroupID) {
+      if (currentConfigNum == -1) {
         return new Error();
       }
-      Map<Integer, Pair<Set<Address>, Set<Integer>>> newConfig = configs.get(currentConfigNum);
+
+      Integer oldGroupID = shardToGroupId.get(move.shardNum());
+      Integer newGroupID = move.groupId();
+
+      // If shard isn't mapped, or we are moving to the same group
+      if (oldGroupID == null || oldGroupID.equals(newGroupID)) {
+        return new Error();
+      }
+
+      Map<Integer, Pair<Set<Address>, Set<Integer>>> newConfig = deepCopyConfig(configs.get(currentConfigNum));
+
+      if (!newConfig.containsKey(newGroupID)) {
+        return new Error();
+      }
+
       currentConfigNum++;
       newConfig.get(oldGroupID).getRight().remove(move.shardNum());
       newConfig.get(newGroupID).getRight().add(move.shardNum());
@@ -198,7 +238,6 @@ public final class ShardMaster implements Application {
     if (command instanceof Query) {
       Query query = (Query) command;
 
-      // Your code here...
       if (currentConfigNum == -1) {
         return new Error();
       } else if (query.configNum() == -1 || query.configNum() > currentConfigNum) {
