@@ -51,7 +51,7 @@ public final class PaxosClient extends Node implements Client {
         if (result != null) return; 
 
         if (!m.isLeader()) {
-            return; // Ignore redirects, let the timer handle retries safely
+            return; 
         }
         
         AMOResult amoResult = m.result();

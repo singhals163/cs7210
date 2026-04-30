@@ -49,7 +49,8 @@ public class PaxosServer extends Node {
 
     @Override
     public void init() {
-        resetElectionTimer();
+        // Bootstrap the single continuous timer loop
+        set(new ElectionTimer(), 250 + (int) (Math.random() * 200));
     }
 
     // --- Required Interfaces ---
@@ -117,18 +118,13 @@ public class PaxosServer extends Node {
 
     // --- Timers and Core Handlers ---
 
-    private void resetElectionTimer() {
-        int timeout = 150 + (int) (Math.random() * 150);
-        set(new ElectionTimer(), timeout);
-    }
-
     private void onElectionTimer(ElectionTimer t) {
+        set(new ElectionTimer(), 250 + (int) (Math.random() * 200));
+
         if (role == Role.LEADER) return;
 
-        // If we received a heartbeat since the last time this popped, defer the election
         if (heardFromLeader) {
             heardFromLeader = false;
-            resetElectionTimer();
             return;
         }
 
@@ -136,16 +132,13 @@ public class PaxosServer extends Node {
         currentTerm++;
         votedFor = address();
         votesReceived = 1;
-        resetElectionTimer();
 
         int lastLogIndex = raftLog.size() - 1;
         int lastLogTerm = raftLog.get(lastLogIndex).term();
 
         RequestVote rv = new RequestVote(currentTerm, address(), lastLogIndex, lastLogTerm);
         for (Address server : servers) {
-            if (!server.equals(address())) {
-                send(rv, server);
-            }
+            if (!server.equals(address())) send(rv, server);
         }
     }
 
@@ -169,7 +162,7 @@ public class PaxosServer extends Node {
 
         if ((votedFor == null || votedFor.equals(sender)) && logIsUpToDate) {
             votedFor = sender;
-            heardFromLeader = true; // Reset election intent since we just voted
+            heardFromLeader = true; 
             send(new RequestVoteReply(currentTerm, true), sender);
         } else {
             send(new RequestVoteReply(currentTerm, false), sender);
@@ -183,7 +176,6 @@ public class PaxosServer extends Node {
             currentTerm = m.term();
             role = Role.FOLLOWER;
             votedFor = null;
-            heardFromLeader = false;
             return;
         }
 
@@ -202,25 +194,28 @@ public class PaxosServer extends Node {
         }
     }
 
+    private void sendAppendEntries(Address server) {
+        int nextIdx = nextIndex.getOrDefault(server, 1);
+        int prevLogIndex = nextIdx - 1;
+        int prevLogTerm = raftLog.get(prevLogIndex).term();
+
+        List<RaftLogEntry> entriesToSend = new ArrayList<>();
+        for (int i = nextIdx; i < raftLog.size(); i++) {
+            entriesToSend.add(raftLog.get(i));
+        }
+
+        AppendEntries ae = new AppendEntries(
+            currentTerm, address(), prevLogIndex, prevLogTerm, entriesToSend, commitIndex, firstNonCleared
+        );
+        send(ae, server);
+    }
+
     private void broadcastAppendEntries() {
         if (role != Role.LEADER) return;
-
         for (Address server : servers) {
-            if (server.equals(address())) continue;
-
-            int nextIdx = nextIndex.get(server);
-            int prevLogIndex = nextIdx - 1;
-            int prevLogTerm = raftLog.get(prevLogIndex).term();
-
-            List<RaftLogEntry> entriesToSend = new ArrayList<>();
-            for (int i = nextIdx; i < raftLog.size(); i++) {
-                entriesToSend.add(raftLog.get(i));
+            if (!server.equals(address())) {
+                sendAppendEntries(server);
             }
-
-            AppendEntries ae = new AppendEntries(
-                currentTerm, address(), prevLogIndex, prevLogTerm, entriesToSend, commitIndex, firstNonCleared
-            );
-            send(ae, server);
         }
     }
 
@@ -237,9 +232,7 @@ public class PaxosServer extends Node {
         }
 
         currentLeaderId = m.leaderId();
-        
-        // This stops the follower from starting an election!
-        heardFromLeader = true; 
+        heardFromLeader = true;
 
         if (m.globalFirstNonCleared() > firstNonCleared) {
             garbageCollect(m.globalFirstNonCleared());
@@ -247,7 +240,7 @@ public class PaxosServer extends Node {
 
         if (raftLog.size() - 1 < m.prevLogIndex() ||
             raftLog.get(m.prevLogIndex()).term() != m.prevLogTerm()) {
-            send(new AppendEntriesReply(currentTerm, false, raftLog.size(), lastApplied), sender);
+            send(new AppendEntriesReply(currentTerm, false, raftLog.size() - 1, lastApplied), sender);
             return;
         }
 
@@ -283,7 +276,6 @@ public class PaxosServer extends Node {
             currentTerm = m.term();
             role = Role.FOLLOWER;
             votedFor = null;
-            heardFromLeader = false;
             return;
         }
 
@@ -291,16 +283,24 @@ public class PaxosServer extends Node {
         checkGarbageCollection();
 
         if (m.success()) {
-            if (m.matchIndex() > matchIndex.get(sender)) {
+            if (m.matchIndex() > matchIndex.getOrDefault(sender, 0)) {
                 matchIndex.put(sender, m.matchIndex());
                 nextIndex.put(sender, m.matchIndex() + 1);
                 advanceCommitIndex();
+            }
+            
+            if (nextIndex.get(sender) < raftLog.size()) {
+                sendAppendEntries(sender);
             }
         } else {
             int backtrackedIndex = m.matchIndex();
             if (backtrackedIndex < nextIndex.get(sender)) {
                 nextIndex.put(sender, Math.max(1, backtrackedIndex));
+            } else {
+                nextIndex.put(sender, Math.max(1, nextIndex.get(sender) - 1));
             }
+            
+            sendAppendEntries(sender);
         }
     }
 
@@ -310,7 +310,7 @@ public class PaxosServer extends Node {
 
             int matchCount = 1;
             for (Address server : servers) {
-                if (!server.equals(address()) && matchIndex.get(server) >= n) {
+                if (!server.equals(address()) && matchIndex.getOrDefault(server, 0) >= n) {
                     matchCount++;
                 }
             }
@@ -327,6 +327,28 @@ public class PaxosServer extends Node {
         if (role != Role.LEADER) {
             send(new PaxosReply(false, currentLeaderId, currentTerm), sender);
             return;
+        }
+
+        if (m.command() instanceof dslabs.atmostonce.AMOCommand) {
+            dslabs.atmostonce.AMOCommand amoCmd = (dslabs.atmostonce.AMOCommand) m.command();
+            
+            if (app.alreadyExecuted(amoCmd)) {
+                send(new PaxosReply((dslabs.atmostonce.AMOResult) app.execute(amoCmd)), sender);
+                return;
+            }
+            
+            boolean isPending = false;
+            for (int i = raftLog.size() - 1; i > commitIndex; i--) {
+                Command pendingCmd = raftLog.get(i).command();
+                if (pendingCmd != null && pendingCmd.equals(amoCmd)) {
+                    isPending = true;
+                    break;
+                }
+            }
+            if (isPending) {
+                broadcastAppendEntries();
+                return; 
+            }
         }
 
         raftLog.add(new RaftLogEntry(currentTerm, m.command()));
@@ -353,7 +375,7 @@ public class PaxosServer extends Node {
         
         followerLastApplied.put(address(), lastApplied);
 
-        set(new HeartbeatTimer(), 50);
+        set(new HeartbeatTimer(), HeartbeatTimer.HEARTBEAT_MILLIS);
         broadcastAppendEntries();
     }
 
