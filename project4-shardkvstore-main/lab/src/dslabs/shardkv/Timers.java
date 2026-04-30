@@ -11,3 +11,7 @@ final class ClientTimer implements Timer {
 }
 
 // Your code here...
+
+final class PingTimer implements Timer {
+  static final int PING_RETRY_MILLIS = 300;
+}

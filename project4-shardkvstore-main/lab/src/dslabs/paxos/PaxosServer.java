@@ -351,14 +351,13 @@ public class PaxosServer extends Node {
                 this.PaxosLog.remove(i);
             } else {
                 // For debugging purposes.
-                LOG.warning("Slot " + i.toString() + " is already removed from PaxosLog.");
-            }
+                System.err.println("Warning: Slot " + i + " is already removed from PaxosLog.");}
 
             if (this.PvalueRecords.containsKey(i)) {
                 this.PvalueRecords.remove(i);
             } else {
                 // For debugging purposes.
-                LOG.warning("Slot " + i.toString() + " not found in PvalueRecords.");
+                System.err.println("Warning: Slot " + i + " not found in PvalueRecords.");  
             }
         }
         this.nextClearSlot = this.slotOut;
