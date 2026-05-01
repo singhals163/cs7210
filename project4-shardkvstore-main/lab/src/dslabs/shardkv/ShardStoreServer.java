@@ -123,7 +123,7 @@ public class ShardStoreServer extends ShardStoreNode {
     if (m.configNum() != currentConfigNum) {
       return;
     }
-    if (!currentConfig.get(groupId).getRight().contains(m.shardId()) && currentManagedShards.contains(m.shardId())) {
+    if (currentManagedShards.contains(m.shardId())) {
       currentManagedShards.remove(m.shardId());
       app.remove(m.shardId());
     }
@@ -186,11 +186,10 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handleMove() {
-    if (!currentConfig.containsKey(groupId)) {
-      return;
-    }
     Set<Integer> shardsToMove = new HashSet<>(currentManagedShards);
-    shardsToMove.removeAll(currentConfig.get(groupId).getRight());
+    if (currentConfig.containsKey(groupId)) {
+      shardsToMove.removeAll(currentConfig.get(groupId).getRight());
+    }
 
     for (Integer shardId : shardsToMove) {
       for (var entry : currentConfig.entrySet()) {
