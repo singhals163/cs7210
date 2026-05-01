@@ -96,18 +96,15 @@ public class ShardStoreServer extends ShardStoreNode {
    */
   private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
     // Your code here...
-    ++localSeqNum;
-    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardStoreCommand(m)), paxosAddress);
+    handleMessage(new PaxosRequest(sender.toString(), m.command().sequenceNumber(), new ShardStoreCommand(m)), paxosAddress);
   }
 
   private void handleMoveRequest(MoveRequest m, Address sender) {
-    ++localSeqNum;
-    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardMoveCmd(m)), paxosAddress);
+    handleMessage(new PaxosRequest("shardMove-"+m.shardId(), m.configNum(), new ShardMoveCmd(m)), paxosAddress);
   }
 
   private void handleMoveReply(MoveReply m, Address sender) {
-    ++localSeqNum;
-    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardMoveAckCmd(m)), paxosAddress);
+    handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId(), m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
   }
 
   void handlePaxosReply(PaxosReply m, Address sender) {
@@ -117,8 +114,7 @@ public class ShardStoreServer extends ShardStoreNode {
       ShardConfig newConfig = (ShardConfig) m.result();
 
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
-        ++localSeqNum;
-        handleMessage(new PaxosRequest(this.address().toString()+localSeqNum, 1, new NewConfigCmd(newConfig)),
+        handleMessage(new PaxosRequest("newConfig", newConfig.configNum(), new NewConfigCmd(newConfig)),
             paxosAddress);
       }
     }
