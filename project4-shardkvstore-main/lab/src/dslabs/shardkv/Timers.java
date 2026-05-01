@@ -6,7 +6,7 @@ import lombok.Data;
 
 @Data
 final class ClientTimer implements Timer {
-  static final int CLIENT_RETRY_MILLIS = 100;
+  static final int CLIENT_RETRY_MILLIS = 200;
 
   // Your code here...
   private final int sequenceNum;
@@ -15,12 +15,12 @@ final class ClientTimer implements Timer {
 // Your code here...
 @Data
 final class PingTimer implements Timer {
-  static final int PING_RETRY_MILLIS = 100;
+  static final int PING_RETRY_MILLIS = 200;
 }
 
 @Data
 final class MoveTimer implements Timer {
   final Address[] destination;
   final MoveRequest request;
-  static final int MOVE_RETRY_MILLIS = 25;
+  static final int MOVE_RETRY_MILLIS = 200;
 }

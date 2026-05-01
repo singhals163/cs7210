@@ -89,16 +89,57 @@ public class ShardStoreServer extends ShardStoreNode {
    * ----------------
    */
   private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
-    // Your code here...
-    handleMessage(new PaxosRequest(sender.toString(), m.command().sequenceNumber(), new ShardStoreCommand(m)), paxosAddress);
+    // Pre-validate before proposing to PAXOS.  PAXOS dedupes (id, seqNum):
+    // once a request has been decided, subsequent re-proposals are silently
+    // dropped (app==null path in PaxosServer.handlePaxosRequest).  If we
+    // proposed something we'd then reject in processKVRequest, the client's
+    // retry would never reach handlePaxosDecision again and would hang.
+    AMOCommand command = m.command();
+
+    if (m.configNum() != currentConfigNum) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      if (m.configNum() > currentConfigNum) {
+        sendConfigRequest(currentConfigNum + 1);
+      }
+      return;
+    }
+    if (currentConfig == null || !currentConfig.containsKey(groupId)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+    Integer shardId = keyToShard(m.key());
+    if (!currentConfig.get(groupId).getRight().contains(shardId)
+        || !currentManagedShards.contains(shardId)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+
+    // Already executed?  Reply directly from the AMO cache so retries don't
+    // depend on PAXOS re-delivering a decision it already dropped.
+    AMOApplication<Application> shardApp = app.get(shardId);
+    if (shardApp.alreadyExecuted(command)) {
+      AMOResult result = shardApp.execute(command);
+      send(new ShardStoreReply(currentConfigNum, result), command.address());
+      return;
+    }
+
+    // Scope the paxos id by configNum so that if the decision of a previous
+    // (id, seqNum) was rejected by processKVRequest due to a NewConfig race,
+    // a retry under the new config gets a fresh paxos slot instead of being
+    // dedup-dropped.  AMO state is keyed by client address, not by this id,
+    // so exactly-once semantics still hold across configs.
+    handleMessage(new PaxosRequest(sender.toString() + "-" + currentConfigNum,
+        command.sequenceNumber(), new ShardStoreCommand(m)), paxosAddress);
   }
 
   private void handleMoveRequest(MoveRequest m, Address sender) {
-    handleMessage(new PaxosRequest("shardMove-"+m.shardId(), m.configNum(), new ShardMoveCmd(m)), paxosAddress);
+    handleMessage(new PaxosRequest("shardMove-" + m.shardId() + "-" + m.configNum(),
+        m.configNum(), new ShardMoveCmd(m)), paxosAddress);
   }
 
   private void handleMoveReply(MoveReply m, Address sender) {
-    handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId(), m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
+    handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId() + "-" + m.configNum(),
+        m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
   }
 
   void handlePaxosReply(PaxosReply m, Address sender) {
@@ -108,8 +149,8 @@ public class ShardStoreServer extends ShardStoreNode {
       ShardConfig newConfig = (ShardConfig) m.result();
 
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
-        handleMessage(new PaxosRequest("newConfig", newConfig.configNum(), new NewConfigCmd(newConfig)),
-            paxosAddress);
+        handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
+            newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
       }
     }
   }
@@ -195,22 +236,27 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void processKVRequest(ShardStoreRequest m) {
-    // TODO: fix this
     AMOCommand command = (AMOCommand) m.command();
-    if (m.configNum() > currentConfigNum) {
-      sendConfigRequest(currentConfigNum + 1);
-      return;
-    } else if (m.configNum() < currentConfigNum) {
+    // Defense-in-depth: pre-checks in handleShardStoreRequest mean we should
+    // never enter this method with a mismatched config in single-server local
+    // paxos.  In reference multi-server paxos a NewConfigCmd can be decided
+    // between propose and decide, so we still send a reply (rather than the
+    // old silent `return`) so the client never hangs waiting on a slot whose
+    // decision will never be re-delivered by paxos's dedup.
+    if (m.configNum() != currentConfigNum) {
       send(new ShardStoreReply(currentConfigNum, null), command.address());
+      if (m.configNum() > currentConfigNum) {
+        sendConfigRequest(currentConfigNum + 1);
+      }
       return;
     }
     if (!currentConfig.containsKey(groupId)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
       return;
     }
     Integer shardId = keyToShard(m.key());
     if ((!currentConfig.get(groupId).getRight().contains(shardId)) || (!currentManagedShards.contains(shardId))) {
-      // TODO: send a reply?
-      // Maybe push these in a queue meanwhile if they've reached the right server?
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
       return;
     }
     AMOResult result = app.get(shardId).execute(m.command());
