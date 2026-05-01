@@ -26,6 +26,8 @@ import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
 import dslabs.shardkv.PingTimer;
 import static dslabs.shardkv.MoveTimer.MOVE_RETRY_MILLIS;
 import dslabs.shardkv.MoveTimer;
+import dslabs.paxos.PaxosDecision;
+import dslabs.paxos.PaxosServer;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -42,6 +44,7 @@ public class ShardStoreServer extends ShardStoreNode {
   private Integer currentConfigNum = -1;
   private Set<Integer> currentManagedShards;
   private Set<Integer> shardsToMove;
+  private int localSeqNum = 0;
 
   /*
    * -----------------------------------------------------------------------------
@@ -55,8 +58,8 @@ public class ShardStoreServer extends ShardStoreNode {
     super(address, shardMasters, numShards);
     this.group = group;
     this.groupId = groupId;
-    PAXOS_ADDRESS_ID = "paxos-" + groupId;
-    PAXOS_PING_ID = "paxos-ping-" + groupId;
+    PAXOS_ADDRESS_ID = "paxos-" + address.toString();
+    PAXOS_PING_ID = "paxos-ping-" + address.toString();
 
     // Your code here...
     this.app = new HashMap<>();
@@ -69,6 +72,17 @@ public class ShardStoreServer extends ShardStoreNode {
   public void init() {
     // Your code here...
     // TODO: send a config query to shardmaster start a timer with shardmaster
+    paxosAddress = Address.subAddress(address(), PAXOS_ADDRESS_ID);
+
+    Address[] paxosAddresses = new Address[group.length];
+    for (int i = 0; i < paxosAddresses.length; i++) {
+      paxosAddresses[i] = Address.subAddress(group[i], PAXOS_ADDRESS_ID);
+    }
+
+    PaxosServer paxosServer = new PaxosServer(paxosAddress, paxosAddresses, address());
+    addSubNode(paxosServer);
+    paxosServer.init();
+
     set(new PingTimer(), PING_RETRY_MILLIS);
 
   }
@@ -82,52 +96,45 @@ public class ShardStoreServer extends ShardStoreNode {
    */
   private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
     // Your code here...
-    if (m.configNum() > currentConfigNum) {
-      sendConfigRequest(currentConfigNum+1);
-      return;
-    } else if (m.configNum() < currentConfigNum) {
-      send(new ShardStoreReply(currentConfigNum, null), sender);
-      return;
-    }
-    Integer shardId = keyToShard(m.key());
-    if ((!currentConfig.get(groupId).getRight().contains(shardId)) || (!currentManagedShards.contains(shardId))) {
-      // TODO: send a reply?
-      // Maybe push these in a queue meanwhile if they've reached the right server?
-      return;
-    }
-    AMOResult result = app.get(shardId).execute(m.command());
-
-    send(new ShardStoreReply(currentConfigNum, result), sender);
+    ++localSeqNum;
+    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardStoreCommand(m)), paxosAddress);
   }
 
   private void handleMoveRequest(MoveRequest m, Address sender) {
-    if (m.configNum() > currentConfigNum) {
-      sendConfigRequest(currentConfigNum+1);
-      return;
-    }
-    if (m.configNum() < currentConfigNum) {
-      send(new MoveReply(m.configNum(), m.shardId()), sender);
-      return;
-    }
-    if (currentConfig.containsKey(groupId) && currentConfig.get(groupId).getRight().contains(m.shardId())) {
-      if (!currentManagedShards.contains(m.shardId())) {
-        app.put(m.shardId(), m.app());
-        currentManagedShards.add(m.shardId());
-      }
-      send(new MoveReply(currentConfigNum, m.shardId()), sender);
-    }
+    ++localSeqNum;
+    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardMoveCmd(m)), paxosAddress);
   }
 
   private void handleMoveReply(MoveReply m, Address sender) {
-    if (m.configNum() > currentConfigNum) {
-      sendConfigRequest(currentConfigNum+1);
-    }
-    if (m.configNum() != currentConfigNum) {
+    ++localSeqNum;
+    handleMessage(new PaxosRequest(PAXOS_ADDRESS_ID+localSeqNum, 1, new ShardMoveAckCmd(m)), paxosAddress);
+  }
+
+  void handlePaxosReply(PaxosReply m, Address sender) {
+    if (!(PAXOS_PING_ID.equals(m.id())))
       return;
+    if (m.result() instanceof ShardConfig) {
+      ShardConfig newConfig = (ShardConfig) m.result();
+
+      if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
+        ++localSeqNum;
+        handleMessage(new PaxosRequest(this.address().toString()+localSeqNum, 1, new NewConfigCmd(newConfig)),
+            paxosAddress);
+      }
     }
-    if (currentManagedShards.contains(m.shardId())) {
-      currentManagedShards.remove(m.shardId());
-      app.remove(m.shardId());
+  }
+
+  private void handlePaxosDecision(PaxosDecision m, Address sender) {
+    Command cmd = m.command();
+
+    if (cmd instanceof ShardStoreCommand) {
+      processKVRequest(((ShardStoreCommand) cmd).request());
+    } else if (cmd instanceof NewConfigCmd) {
+      processNewConfig(((NewConfigCmd) cmd).config());
+    } else if (cmd instanceof ShardMoveCmd) {
+      processMoveRequest(((ShardMoveCmd) cmd).request());
+    } else if (cmd instanceof ShardMoveAckCmd) {
+      processMoveReply(((ShardMoveAckCmd) cmd).reply());
     }
   }
 
@@ -165,29 +172,6 @@ public class ShardStoreServer extends ShardStoreNode {
     broadcastToShardMasters(new PaxosRequest(PAXOS_PING_ID, 0, new Query(configNum)));
   }
 
-  void handlePaxosReply(PaxosReply m, Address sender) {
-    if (!(PAXOS_PING_ID.equals(m.id()))) {
-      return;
-    }
-    if (m.result() instanceof ShardConfig) {
-      ShardConfig newConfig = (ShardConfig) m.result();
-      if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
-        currentConfigNum = newConfig.configNum();
-        currentConfig = newConfig.groupInfo();
-        if (currentConfigNum == 0) {
-          if (currentConfig.containsKey(groupId)) {
-            currentManagedShards.addAll(currentConfig.get(groupId).getRight());
-            for (Integer shard : currentManagedShards) {
-              app.putIfAbsent(shard, new AMOApplication<>(new KVStore()));
-            }
-          }
-        } else {
-          handleMove();
-        }
-      }
-    }
-  }
-
   private void handleMove() {
     Set<Integer> shardsToMove = new HashSet<>(currentManagedShards);
     if (currentConfig.containsKey(groupId)) {
@@ -202,7 +186,7 @@ public class ShardStoreServer extends ShardStoreNode {
 
         if (value.getRight().contains(shardId)) {
 
-          MoveRequest request = new MoveRequest(currentConfigNum, shardId, moveApp);
+          MoveRequest request = new MoveRequest(currentConfigNum, shardId, moveApp, group);
           set(new MoveTimer(value.getLeft().toArray(new Address[0]), request), MOVE_RETRY_MILLIS);
         }
       }
@@ -217,6 +201,80 @@ public class ShardStoreServer extends ShardStoreNode {
       return currentManagedShards.isEmpty();
     }
     return currentManagedShards.equals(currentConfig.get(groupId).getRight());
+  }
+
+  private void processKVRequest(ShardStoreRequest m) {
+    // TODO: fix this
+    AMOCommand command = (AMOCommand) m.command();
+    if (m.configNum() > currentConfigNum) {
+      sendConfigRequest(currentConfigNum + 1);
+      return;
+    } else if (m.configNum() < currentConfigNum) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+    if (!currentConfig.containsKey(groupId)) {
+      return;
+    }
+    Integer shardId = keyToShard(m.key());
+    if ((!currentConfig.get(groupId).getRight().contains(shardId)) || (!currentManagedShards.contains(shardId))) {
+      // TODO: send a reply?
+      // Maybe push these in a queue meanwhile if they've reached the right server?
+      return;
+    }
+    AMOResult result = app.get(shardId).execute(m.command());
+
+    send(new ShardStoreReply(currentConfigNum, result), command.address());
+  }
+
+  private void processMoveRequest(MoveRequest m) {
+    if (m.configNum() > currentConfigNum) {
+      sendConfigRequest(currentConfigNum + 1);
+      return;
+    }
+    if (m.configNum() < currentConfigNum) {
+      broadcast(new MoveReply(m.configNum(), m.shardId()), m.senders());
+      return;
+    }
+    if (currentConfig.containsKey(groupId) && currentConfig.get(groupId).getRight().contains(m.shardId())) {
+      if (!currentManagedShards.contains(m.shardId())) {
+        app.put(m.shardId(), m.app());
+        currentManagedShards.add(m.shardId());
+      }
+      broadcast(new MoveReply(currentConfigNum, m.shardId()), m.senders());
+    }
+  }
+
+  private void processMoveReply(MoveReply m) {
+    // TODO: fix this
+    if (m.configNum() > currentConfigNum) {
+      sendConfigRequest(currentConfigNum + 1);
+    }
+    if (m.configNum() != currentConfigNum) {
+      return;
+    }
+    if (currentManagedShards.contains(m.shardId())) {
+      currentManagedShards.remove(m.shardId());
+      app.remove(m.shardId());
+    }
+  }
+
+  void processNewConfig(ShardConfig newConfig) {
+    // TODO: fix this
+    if (newConfig.configNum() == currentConfigNum + 1) {
+      currentConfigNum = newConfig.configNum();
+      currentConfig = newConfig.groupInfo();
+      if (currentConfigNum == 0) {
+        if (currentConfig.containsKey(groupId)) {
+          currentManagedShards.addAll(currentConfig.get(groupId).getRight());
+          for (Integer shard : currentManagedShards) {
+            app.putIfAbsent(shard, new AMOApplication<>(new KVStore()));
+          }
+        }
+      } else {
+        handleMove();
+      }
+    }
   }
 
 }

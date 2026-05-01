@@ -15,7 +15,7 @@ final class ClientTimer implements Timer {
 // Your code here...
 @Data
 final class PingTimer implements Timer {
-  static final int PING_RETRY_MILLIS = 200;
+  static final int PING_RETRY_MILLIS = 100;
 }
 
 @Data
