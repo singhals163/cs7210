@@ -36,15 +36,13 @@ public class ShardStoreServer extends ShardStoreNode {
   private final int groupId;
 
   // Your code here...
-  private final String PAXOS_ADDRESS_ID;
-  private final String PAXOS_PING_ID;
+  private static final String PAXOS_ADDRESS_ID = "paxos";
+  private static final String PAXOS_PING_ID = "paxos-ping";
   private Address paxosAddress;
   private Map<Integer, AMOApplication<Application>> app;
   private Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig;
   private Integer currentConfigNum = -1;
   private Set<Integer> currentManagedShards;
-  private Set<Integer> shardsToMove;
-  private int localSeqNum = 0;
 
   /*
    * -----------------------------------------------------------------------------
@@ -58,14 +56,10 @@ public class ShardStoreServer extends ShardStoreNode {
     super(address, shardMasters, numShards);
     this.group = group;
     this.groupId = groupId;
-    PAXOS_ADDRESS_ID = "paxos-" + address.toString();
-    PAXOS_PING_ID = "paxos-ping-" + address.toString();
 
     // Your code here...
     this.app = new HashMap<>();
     this.currentManagedShards = new HashSet<>();
-    this.shardsToMove = new HashSet<>();
-
   }
 
   @Override
@@ -181,9 +175,10 @@ public class ShardStoreServer extends ShardStoreNode {
         AMOApplication moveApp = app.get(shardId);
 
         if (value.getRight().contains(shardId)) {
-
           MoveRequest request = new MoveRequest(currentConfigNum, shardId, moveApp, group);
-          set(new MoveTimer(value.getLeft().toArray(new Address[0]), request), MOVE_RETRY_MILLIS);
+          Address[] dest = value.getLeft().toArray(new Address[0]);
+          broadcast(request, dest);
+          set(new MoveTimer(dest, request), MOVE_RETRY_MILLIS);
         }
       }
     }
