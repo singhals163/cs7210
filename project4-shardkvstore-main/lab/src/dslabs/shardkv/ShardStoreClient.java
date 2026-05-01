@@ -114,9 +114,11 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
       // send getView to viewserver
       sendConfigRequest(-1);
       return;
-    } else if(m.configNum() < currentConfigNum || m.result() == null) {
-      // TODO: send the command again quickly?
+    } else if(m.configNum() < currentConfigNum) {
+      // TODO: send the command again quickly? fragile logic
       sendPendingCommand();
+      return;
+    } else if(m.result() == null) {
       return;
     } else {
       AMOResult res = (AMOResult)(m.result());
