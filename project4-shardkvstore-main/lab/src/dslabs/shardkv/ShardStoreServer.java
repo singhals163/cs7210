@@ -88,12 +88,9 @@ public class ShardStoreServer extends ShardStoreNode {
    * -----------------------------------------------------------------------------
    * ----------------
    */
+  // The handleX functions and processX functions are exactly the same except for
+  // handleX doesn't really make changes in the server's data structures.
   private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
-    // Pre-validate before proposing to PAXOS.  PAXOS dedupes (id, seqNum):
-    // once a request has been decided, subsequent re-proposals are silently
-    // dropped (app==null path in PaxosServer.handlePaxosRequest).  If we
-    // proposed something we'd then reject in processKVRequest, the client's
-    // retry would never reach handlePaxosDecision again and would hang.
     AMOCommand command = m.command();
 
     if (m.configNum() != currentConfigNum) {
@@ -114,20 +111,12 @@ public class ShardStoreServer extends ShardStoreNode {
       return;
     }
 
-    // Already executed?  Reply directly from the AMO cache so retries don't
-    // depend on PAXOS re-delivering a decision it already dropped.
     AMOApplication<Application> shardApp = app.get(shardId);
     if (shardApp.alreadyExecuted(command)) {
       AMOResult result = shardApp.execute(command);
       send(new ShardStoreReply(currentConfigNum, result), command.address());
       return;
     }
-
-    // Scope the paxos id by configNum so that if the decision of a previous
-    // (id, seqNum) was rejected by processKVRequest due to a NewConfig race,
-    // a retry under the new config gets a fresh paxos slot instead of being
-    // dedup-dropped.  AMO state is keyed by client address, not by this id,
-    // so exactly-once semantics still hold across configs.
     handleMessage(new PaxosRequest(sender.toString() + "-" + currentConfigNum,
         command.sequenceNumber(), new ShardStoreCommand(m)), paxosAddress);
   }
