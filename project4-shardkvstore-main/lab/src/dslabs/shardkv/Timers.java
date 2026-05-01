@@ -22,5 +22,5 @@ final class PingTimer implements Timer {
 final class MoveTimer implements Timer {
   final Address[] destination;
   final MoveRequest request;
-  static final int MOVE_RETRY_MILLIS = 200;
+  static final int MOVE_RETRY_MILLIS = 100;
 }

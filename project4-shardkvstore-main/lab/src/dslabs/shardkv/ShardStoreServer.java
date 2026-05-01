@@ -133,13 +133,35 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handleMoveRequest(MoveRequest m, Address sender) {
-    handleMessage(new PaxosRequest("shardMove-" + m.shardId() + "-" + m.configNum(),
-        m.configNum(), new ShardMoveCmd(m)), paxosAddress);
+    if (m.configNum() > currentConfigNum) {
+      sendConfigRequest(currentConfigNum + 1);
+      return;
+    }
+    if (m.configNum() < currentConfigNum) {
+      broadcast(new MoveReply(m.configNum(), m.shardId()), m.senders());
+      return;
+    }
+    if (currentConfig.containsKey(groupId) && currentConfig.get(groupId).getRight().contains(m.shardId())) {
+      if (!currentManagedShards.contains(m.shardId())) {
+        handleMessage(new PaxosRequest("shardMove-" + m.shardId() + "-" + m.configNum(),
+            m.configNum(), new ShardMoveCmd(m)), paxosAddress);
+      } else {
+        broadcast(new MoveReply(currentConfigNum, m.shardId()), m.senders());
+      }
+    }
   }
 
   private void handleMoveReply(MoveReply m, Address sender) {
-    handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId() + "-" + m.configNum(),
-        m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
+    if (m.configNum() > currentConfigNum) {
+      sendConfigRequest(currentConfigNum + 1);
+    }
+    if (m.configNum() != currentConfigNum) {
+      return;
+    }
+    if (currentManagedShards.contains(m.shardId())) {
+      handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId() + "-" + m.configNum(),
+          m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
+    }
   }
 
   void handlePaxosReply(PaxosReply m, Address sender) {
