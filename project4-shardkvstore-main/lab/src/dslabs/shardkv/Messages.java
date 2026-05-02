@@ -44,6 +44,35 @@ final class MoveReply implements Message {
 }
 
 @Data
+final class PrepareTransactionRequest implements Message {
+  private final Integer configNum;
+  private final AMOCommand command;
+  private final Address[] senders;
+}
+
+@Data
+final class PrepareTransactionReply implements Message {
+  private final Integer configNum;
+  private final boolean result;
+  private final Integer groupId;
+}
+
+@Data
+final class CommitTransactionReqeust implements Message {
+  private final Integer ConfigNum;
+  private final AMOCommand command;
+  private final Address[] senders;
+  private final boolean commit;
+}
+
+@Data
+final class CommitTransactionReply implements Message {
+  private final Integer ConfigNum;
+  private final boolean result;
+  private final Integer groupId;
+}
+
+@Data
 final class ShardStoreCommand implements Command {
   private final ShardStoreRequest request;
 }

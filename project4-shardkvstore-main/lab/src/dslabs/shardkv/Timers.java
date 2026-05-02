@@ -24,3 +24,10 @@ final class MoveTimer implements Timer {
   final MoveRequest request;
   static final int MOVE_RETRY_MILLIS = 100;
 }
+
+@Data
+final class PrepareTimer implements Timer {
+  final Address[] destination;
+  final PrepareTransactionRequest request;
+  static final int PREPARE_RETRY_MILLIS = 100;
+}

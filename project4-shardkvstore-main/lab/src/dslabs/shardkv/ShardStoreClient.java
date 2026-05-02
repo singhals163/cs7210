@@ -1,6 +1,9 @@
 package dslabs.shardkv;
 
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -18,6 +21,7 @@ import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
 import static dslabs.shardkv.ClientTimer.CLIENT_RETRY_MILLIS;
 import dslabs.shardkv.ShardStoreReply;
 import dslabs.kvstore.KVStore.*;
+import dslabs.kvstore.TransactionalKVStore.*;
 import dslabs.paxos.PaxosRequest;
 import dslabs.paxos.PaxosReply;
 import dslabs.shardmaster.ShardMaster.Query;
@@ -37,9 +41,13 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
   private Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig;
   private final String PAXOS_PING_ID;
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Construction and Initialization
-   * ---------------------------------------------------------------------------------------------*/
+  /*
+   * -----------------------------------------------------------------------------
+   * ------------------
+   * Construction and Initialization
+   * -----------------------------------------------------------------------------
+   * ----------------
+   */
   public ShardStoreClient(Address address, Address[] shardMasters, int numShards) {
     super(address, shardMasters, numShards);
     currentConfigNum = -1;
@@ -55,14 +63,19 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     set(new PingTimer(), PING_RETRY_MILLIS);
   }
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Client Methods
-   * ---------------------------------------------------------------------------------------------*/
+  /*
+   * -----------------------------------------------------------------------------
+   * ------------------
+   * Client Methods
+   * -----------------------------------------------------------------------------
+   * ----------------
+   */
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
-    if(!(command instanceof Get || command instanceof Put || command instanceof Append)) {
-        throw new IllegalArgumentException();
+    if (!(command instanceof Get || command instanceof Put || command instanceof Append
+        || command instanceof Transaction)) {
+      throw new IllegalArgumentException();
     }
     sequenceNum++;
     currentCommand = new AMOCommand(command, sequenceNum, this.address());
@@ -82,44 +95,66 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
   @Override
   public synchronized Result getResult() throws InterruptedException {
     // Your code here...
-    while(!hasResult())
+    while (!hasResult())
       wait();
     return result;
   }
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Message Handlers
-   * ---------------------------------------------------------------------------------------------*/
+  /*
+   * -----------------------------------------------------------------------------
+   * ------------------
+   * Message Handlers
+   * -----------------------------------------------------------------------------
+   * ----------------
+   */
   private void sendPendingCommand() {
     if (currentCommand == null || result != null || currentConfigNum == -1) {
-        return;
+      return;
     }
-    
-    String key = ((SingleKeyCommand)currentCommand.command()).key();
-    Integer shardId = keyToShard(key);
-    
-    for (var entry : currentConfig.entrySet()) {
+    if (command instanceof SingleKeyCommand) {
+      String key = ((SingleKeyCommand) currentCommand.command()).key();
+      Integer shardId = keyToShard(key);
+
+      for (var entry : currentConfig.entrySet()) {
         if (entry.getValue().getRight().contains(shardId)) {
-            Address[] destination = entry.getValue().getLeft().toArray(new Address[0]);
-            ShardStoreRequest request = new ShardStoreRequest(currentConfigNum, key, currentCommand);
-            broadcast(request, destination);
-            return;
+          Address[] destination = entry.getValue().getLeft().toArray(new Address[0]);
+          ShardStoreRequest request = new ShardStoreRequest(currentConfigNum, key, currentCommand);
+          broadcast(request, destination);
+          return;
         }
+      }
+    } else {
+      Set<String> keys = command.keySet();
+      Set<Integer> shardsIds = new HashSet<>();
+      for (String key : keys) {
+        shardsIds.add(keyToShard(key));
+      }
+      Set<Integer> groupIds;
+      for (var entry : currentConfig.entrySet()) {
+        if (!(Collections.disjoint(entry.getValue().getRight(), shardsIds))) {
+          groupIds.add(entry.getKey());
+        }
+      }
+      Integer groupId = Collections.min(groupIds);
+      Address[] destination = currentConfig.get(groupId).getLeft().toArray(new Address[0]);
+      ShardStoreRequest request = new ShardStoreRequest(currentConfigNum, "", currentCommand);
+      broadcast(request, destination);
+      return;
     }
-}
+  }
 
   private synchronized void handleShardStoreReply(ShardStoreReply m, Address sender) {
     // Your code here...
-    if(m.configNum() > currentConfigNum) {
+    if (m.configNum() > currentConfigNum) {
       // send getView to viewserver
       sendConfigRequest(-1);
       return;
-    } else if(m.configNum() < currentConfigNum || m.result() == null) {
+    } else if (m.configNum() < currentConfigNum || m.result() == null) {
       // TODO: send the command again quickly? fragile logic
       return;
     } else {
-      AMOResult res = (AMOResult)(m.result());
-      if(currentCommand != null && result == null && res.sequenceNumber() == sequenceNum) {
+      AMOResult res = (AMOResult) (m.result());
+      if (currentCommand != null && result == null && res.sequenceNumber() == sequenceNum) {
         this.result = res.result();
         notify();
       }
@@ -143,14 +178,18 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
 
   // Your code here...
 
-  /* -----------------------------------------------------------------------------------------------
-   *  Timer Handlers
-   * ---------------------------------------------------------------------------------------------*/
+  /*
+   * -----------------------------------------------------------------------------
+   * ------------------
+   * Timer Handlers
+   * -----------------------------------------------------------------------------
+   * ----------------
+   */
   private synchronized void onClientTimer(ClientTimer t) {
     // Your code here...
     if (currentCommand != null && result == null && t.sequenceNum() == sequenceNum) {
-        sendPendingCommand();
-        set(t, CLIENT_RETRY_MILLIS);
+      sendPendingCommand();
+      set(t, CLIENT_RETRY_MILLIS);
     }
   }
 

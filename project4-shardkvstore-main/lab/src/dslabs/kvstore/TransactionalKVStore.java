@@ -145,6 +145,13 @@ public class TransactionalKVStore extends KVStore {
     if (command instanceof Transaction) {
       Transaction t = (Transaction) command;
       // Your code here...
+      if(t instanceof MultiGet) {
+        return ((MultiGet)t).run(store);
+      } else if(t instanceof MultiPut) {
+        return ((MultiPut)t).run(store);
+      } else if(t instanceof Swap) {
+        return ((Swap)t).run(store);
+      }
     }
 
     return super.execute(command);
