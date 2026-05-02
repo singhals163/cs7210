@@ -31,3 +31,10 @@ final class PrepareTimer implements Timer {
   final PrepareTransactionRequest request;
   static final int PREPARE_RETRY_MILLIS = 100;
 }
+
+@Data
+final class CommitTimer implements Timer {
+  final Address[] destination;
+  final CommitTransactionRequest request;
+  static final int COMMIT_RETRY_MILLIS = 100;
+}
