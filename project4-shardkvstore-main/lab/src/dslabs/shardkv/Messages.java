@@ -58,8 +58,8 @@ final class PrepareTransactionReply implements Message {
 }
 
 @Data
-final class CommitTransactionReqeust implements Message {
-  private final Integer ConfigNum;
+final class CommitTransactionRequest implements Message {
+  private final Integer configNum;
   private final AMOCommand command;
   private final Address[] senders;
   private final boolean commit;
@@ -67,9 +67,10 @@ final class CommitTransactionReqeust implements Message {
 
 @Data
 final class CommitTransactionReply implements Message {
-  private final Integer ConfigNum;
-  private final boolean result;
+  private final Integer configNum;
+  private final boolean committed;
   private final Integer groupId;
+  private final dslabs.kvstore.KVStore.KVStoreResult partialResult;
 }
 
 @Data

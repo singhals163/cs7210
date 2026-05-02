@@ -1,20 +1,16 @@
 package dslabs.shardkv;
 
 import dslabs.framework.Address;
-import dslabs.framework.Command;
 import dslabs.framework.Application;
+import dslabs.framework.Command;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Set;
-
-import javax.sql.rowset.spi.TransactionalWriter;
-
 import java.util.Map;
-import java.util.Objects;
+import java.util.Set;
 
 import dslabs.shardmaster.ShardMaster.Query;
 import dslabs.shardmaster.ShardMaster.ShardConfig;
@@ -22,19 +18,20 @@ import dslabs.shardmaster.ShardMaster.ShardConfig;
 import dslabs.atmostonce.AMOApplication;
 import dslabs.atmostonce.AMOCommand;
 import dslabs.atmostonce.AMOResult;
-import dslabs.shardkv.ShardStoreReply;
+import dslabs.paxos.PaxosDecision;
 import dslabs.paxos.PaxosReply;
 import dslabs.paxos.PaxosRequest;
-import dslabs.kvstore.KVStore;
-import org.apache.commons.lang3.tuple.Pair;
-import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
-import dslabs.shardkv.PingTimer;
-import static dslabs.shardkv.MoveTimer.MOVE_RETRY_MILLIS;
-import dslabs.shardkv.MoveTimer;
-import dslabs.paxos.PaxosDecision;
 import dslabs.paxos.PaxosServer;
-import dslabs.kvstore.KVStore.*;
-import dslabs.kvstore.TransactionalKVStore.*;
+
+import dslabs.kvstore.KVStore.KVStoreResult;
+import dslabs.kvstore.KVStore.SingleKeyCommand;
+import dslabs.kvstore.TransactionalKVStore;
+import dslabs.kvstore.TransactionalKVStore.Transaction;
+
+import org.apache.commons.lang3.tuple.Pair;
+
+import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
+import static dslabs.shardkv.MoveTimer.MOVE_RETRY_MILLIS;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -42,25 +39,34 @@ public class ShardStoreServer extends ShardStoreNode {
   private final Address[] group;
   private final int groupId;
 
-  // Your code here...
+  // ---------- paxos sub-node config (unchanged) ----------
   private static final String PAXOS_ADDRESS_ID = "paxos";
   private static final String PAXOS_PING_ID = "paxos-ping";
   private Address paxosAddress;
+
+  // ---------- shard state ----------
   private Map<Integer, AMOApplication<Application>> app;
   private Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig;
   private Integer currentConfigNum = -1;
   private Set<Integer> currentManagedShards;
-  private boolean serverLocked;
-  private Set<Integer> currentTransactionGroupIds;
-  private Set<Integer> prepareTransactionGroupIds;
-  private AMOCommand currentTransaction;
+
+  // ---------- transaction state ----------
+  // Server-level lock with owner identity.  Held by the coordinator from the
+  // moment we admit a transaction until we reply to the client; held by a
+  // participant from the moment we vote YES on PREPARE until we receive the
+  // matching COMMIT/ABORT.  Re-entrant for the same AMOCommand so duplicate
+  // PREPAREs are idempotent.
+  private AMOCommand lockHolder = null;
+
+  // AMO cache for transactions: clientAddr -> last-seen result.
+  // Single-key commands keep their existing per-shard AMOApplication cache;
+  // transactions are cached at server level because they may span shards.
+  private Map<Address, AMOResult> txnAmoCache = new HashMap<>();
 
   /*
    * -----------------------------------------------------------------------------
-   * ------------------
    * Construction and Initialization
    * -----------------------------------------------------------------------------
-   * ----------------
    */
   ShardStoreServer(
       Address address, Address[] shardMasters, int numShards, Address[] group, int groupId) {
@@ -68,18 +74,12 @@ public class ShardStoreServer extends ShardStoreNode {
     this.group = group;
     this.groupId = groupId;
 
-    // Your code here...
     this.app = new HashMap<>();
     this.currentManagedShards = new HashSet<>();
-    this.serverLocked = false;
-    this.currentTransactionGroupIds = new HashSet<>();
-    this.prepareTransactionGroupIds = new HashSet<>();
   }
 
   @Override
   public void init() {
-    // Your code here...
-    // TODO: send a config query to shardmaster start a timer with shardmaster
     paxosAddress = Address.subAddress(address(), PAXOS_ADDRESS_ID);
 
     Address[] paxosAddresses = new Address[group.length];
@@ -92,17 +92,26 @@ public class ShardStoreServer extends ShardStoreNode {
     paxosServer.init();
 
     set(new PingTimer(), PING_RETRY_MILLIS);
-
   }
 
   /*
    * -----------------------------------------------------------------------------
-   * ------------------
    * Message Handlers
    * -----------------------------------------------------------------------------
-   * ----------------
    */
 
+  // Top-level dispatch: route by command type.  SingleKey commands keep going
+  // through paxos as before; transactions take the new coordinator path.
+  private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
+    Command inner = m.command().command();
+    if (inner instanceof SingleKeyCommand) {
+      handleShardStoreSingleKeyRequest(m, sender);
+    } else if (inner instanceof Transaction) {
+      handleShardStoreCoordinator(m, sender);
+    }
+  }
+
+  // ---------------- SingleKey path (unchanged from part 3) ----------------
   private void handleShardStoreSingleKeyRequest(ShardStoreRequest m, Address sender) {
     AMOCommand command = m.command();
     if (m.configNum() != currentConfigNum) {
@@ -131,176 +140,91 @@ public class ShardStoreServer extends ShardStoreNode {
     }
     handleMessage(new PaxosRequest(sender.toString() + "-" + currentConfigNum,
         command.sequenceNumber(), new ShardStoreCommand(m)), paxosAddress);
-
   }
 
-  // The handleX functions and processX functions are exactly the same except for
-  // handleX doesn't really make changes in the server's data structures.
-  private void handleShardStoreRequest(ShardStoreRequest m, Address sender) {
-    if (m.command().command() instanceof SingleKeyCommand) {
-      handleShardStoreSingleKeyRequest(m, sender);
-    } else {
-      handleShardStoreMultiKeyRequest(m, sender);
-      // TODO: handle multiple replica servers later. for now, let's try the single
-      // server approach
+  // ---------------- Transaction coordinator path (step 2) ----------------
+  // Step 2 handles only the single-group case end-to-end (lock → execute →
+  // cache → reply).  Multi-group 2PC is left as a TODO for step 3; for now we
+  // fall through to a `null` reply so the client retries / refreshes config.
+  private void handleShardStoreCoordinator(ShardStoreRequest m, Address sender) {
+    AMOCommand command = m.command();
+    Transaction txn = (Transaction) command.command();
 
+    // 1. Configuration / membership pre-checks.
+    if (!coordinatorPreChecksPass(m, command, txn)) {
+      return;
     }
+
+    // 2. AMO cache: served retries don't re-execute.
+    AMOResult cached = txnAmoCache.get(command.address());
+    if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+      send(new ShardStoreReply(currentConfigNum, cached), command.address());
+      return;
+    }
+
+    // 3. Acquire the server-level lock (owner-tracked).
+    if (!tryLock(command)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+
+    Set<Integer> participants = participantsForTransaction(txn);
+
+    // 4. Single-group fast path: just run it on our shards.  No 2PC, no paxos.
+    if (participants.size() == 1) {
+      KVStoreResult result = executeTransactionOnOwnedShards(txn);
+      AMOResult amoResult = new AMOResult(command.sequenceNumber(), result);
+      txnAmoCache.put(command.address(), amoResult);
+      releaseLock(command);
+      send(new ShardStoreReply(currentConfigNum, amoResult), command.address());
+      return;
+    }
+
+    // 5. Multi-group case: deferred to step 3 (PREPARE → COMMIT 2PC).
+    // For now release and reply null so the client doesn't hang.
+    releaseLock(command);
+    send(new ShardStoreReply(currentConfigNum, null), command.address());
   }
 
-  /*
-  Find the intersection of shardIds with currentManagedShards: call it shardsToLock
-  Take a lock on each of the shards in shardsToLock
-  if lock taken successfully: 
-    - return true
-    - release all locks that were successful, return false
-  We can initially do it at a server level too, lock the entire server, which is easier to implement 
-  */
-  private boolean takeLocks() {
-    // TODO: write this implementation
-    if(serverLocked) return false;
-    serverLocked = true;
+  // Group ownership of `keyToShard(key)` for every key in the transaction must
+  // be settled (we own it AND have it).  Also enforces "client picks lowest
+  // groupId as coordinator" server-side.
+  private boolean coordinatorPreChecksPass(
+      ShardStoreRequest m, AMOCommand command, Transaction txn) {
+    if (m.configNum() != currentConfigNum) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      if (m.configNum() > currentConfigNum) {
+        sendConfigRequest(currentConfigNum + 1);
+      }
+      return false;
+    }
+    if (currentConfig == null || !currentConfig.containsKey(groupId) || !isStable()) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return false;
+    }
+
+    // Every key whose shard is owned by us must actually be in
+    // currentManagedShards (i.e. we've fully received it).
+    for (String key : txn.keySet()) {
+      int shardId = keyToShard(key);
+      if (currentConfig.get(groupId).getRight().contains(shardId)
+          && !currentManagedShards.contains(shardId)) {
+        send(new ShardStoreReply(currentConfigNum, null), command.address());
+        return false;
+      }
+    }
+
+    // Enforce coordinator = min(participants).  If we aren't, tell client.
+    Set<Integer> participants = participantsForTransaction(txn);
+    if (participants.isEmpty() || groupId != Collections.min(participants)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return false;
+    }
+
     return true;
   }
 
-  /*
-  CRITICAL: Ensure that the one who took the lock can only release it
-  */
-  private void releaseLock() {
-    serverLocked = false;
-  }
-
-  /*
-  handleShardStoreMultiKeyRequest()
-   * // Step 1. Match configNum and perform other checks
-   * // Step 2. Take locks for our shards
-   * // Step 3. Send Prepare request to other servers
-   * // Step 4. Start a timer
-   */
-  private void handleShardStoreMultiKeyRequest(ShardStoreRequest m, Address sender) {
-    Command command = (AMOCommand)(m.command());
-    if (m.configNum() != currentConfigNum) {
-      send(new ShardStoreReply(currentConfigNum, null), command.address());
-      if (m.configNum() > currentConfigNum) {
-        sendConfigRequest(currentConfigNum + 1);
-      }
-      return;
-    }
-    if (currentConfig == null || !currentConfig.containsKey(groupId)) {
-      send(new ShardStoreReply(currentConfigNum, null), command.address());
-      return;
-    }
-    Set<String> keys = ((Transaction)command.command()).keySet();
-    Set<Integer> shardsIds = new HashSet<>();
-    for (String key : keys) {
-      shardsIds.add(keyToShard(key));
-    }
-    Set<Integer> groupIds;
-    for (var entry : currentConfig.entrySet()) {
-      if (!(Collections.disjoint(entry.getValue().getRight(), shardsIds))) {
-        groupIds.add(entry.getKey());
-      }
-    }
-    if(!(groupIds.contains(groupId)) || !isStable()) {
-      send(new ShardStoreReply(currentConfigNum, null), command.address());
-      return;
-    }
-    Set<Integers> myShardsToLock = new HashSet<>(currentManagedShards);
-    if(takeLocks(myShardsToLock.retainAll(shardIds))) {
-      // TODO: send prepare requests to other servers
-      for(Integer otherGroupId:groupIds){
-        Address[] destination = currentConfig.get(otherGroupId).getLeft().toArray(new Address[0]);
-        PrepareTransactionRequest request = new PrepareTransactionRequest(currentConfigNum, command, group);
-        broadcast(request, destination);
-        currentTransactionGroupIds = groupIds;
-        currentTransaction = command;
-        // TODO: start relevant timers
-        set(new PrepareTimer(destination, reqeust), PREPARE_RETRY_MILLIS);
-      }
-    } else {
-      send(new ShardStoreReply(currentConfigNum, null), command.address());
-      return;
-    }
-  }
-
-
-  /*
-   * handlePrepareTransactionRequest()
-   * Match confignum, if doesn't match send a reject message
-   * Take lock on shards:
-   * - if taken, send prepare accept message
-   * - if already locked
-   * - send a reject message
-   */
-  private void handlePrepareTransactionRequest(PrepareTransactionRequest m, Address sender) {
-    Command command = (AMOCommand)(m.command());
-    if (m.configNum() != currentConfigNum) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, false, groupId), m.senders());
-      if (m.configNum() > currentConfigNum) {
-        sendConfigRequest(currentConfigNum + 1);
-      }
-      return;
-    }
-    if (currentConfig == null || !currentConfig.containsKey(groupId)) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, false, groupId), m.senders());
-      return;
-    }
-    Set<String> keys = ((Transaction)command.command()).keySet();
-    Set<Integer> shardsIds = new HashSet<>();
-    for (String key : keys) {
-      shardsIds.add(keyToShard(key));
-    }
-    if(!isStable() || Collections.disjoint(shardIds, currentManagedShards)) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, false, groupId), m.senders());
-      return;
-    }
-    if(takeLocks()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, true, groupId), m.senders());
-      return;
-    } else {
-      broadcast(new PrepareTransactionReply(currentConfigNum, false, groupId), m.senders());
-      return;
-    }
-  }
-
-  /*
-   * handlePrepareTransactionReply()
-   * - if reject, abort transaction, release locks, send abort request
-   * - if accept, add that to the set of accepts
-   * - if accept set complete, start commit phase
-   */
-  private void handlePrepareTransactionReply(PrepareTransactionReply m, Address sender) {
-    if(m.result()) {
-      prepareTransactionGroupIds.add(m.groupId());
-      // add group id to the current transactions groups
-      beginCommitPhase();
-    } else {
-      // abort transaction
-      beginAbortPhase();
-    }
-  }
-
-
-  /*
-   * beginCommitPhase()
-   * - send commit request to other servers and start timers
-   */
-  private void beginCommitPhase() {
-    if(Objects.equals(currentTransactionGroupIds, prepareTransactionGroupIds)) {
-
-    }
-  }
-
-  /*
-   * handleCommitRequest()
-   * - commit changes if not already commited and send commit reply
-   */
-
-  /*
-   * handleCommitReply()
-   * - put commit reply to the list of accepted commits
-   * - when the set is complete reply with ack to the client
-   */
-
+  // ---------------- Move/paxos handlers (unchanged from part 3) ----------------
   private void handleMoveRequest(MoveRequest m, Address sender) {
     if (m.configNum() > currentConfigNum) {
       sendConfigRequest(currentConfigNum + 1);
@@ -334,11 +258,9 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   void handlePaxosReply(PaxosReply m, Address sender) {
-    if (!(PAXOS_PING_ID.equals(m.id())))
-      return;
+    if (!PAXOS_PING_ID.equals(m.id())) return;
     if (m.result() instanceof ShardConfig) {
       ShardConfig newConfig = (ShardConfig) m.result();
-
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
         handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
             newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
@@ -348,7 +270,6 @@ public class ShardStoreServer extends ShardStoreNode {
 
   private void handlePaxosDecision(PaxosDecision m, Address sender) {
     Command cmd = m.command();
-
     if (cmd instanceof ShardStoreCommand) {
       processKVRequest(((ShardStoreCommand) cmd).request());
     } else if (cmd instanceof NewConfigCmd) {
@@ -362,12 +283,9 @@ public class ShardStoreServer extends ShardStoreNode {
 
   /*
    * -----------------------------------------------------------------------------
-   * ------------------
    * Timer Handlers
    * -----------------------------------------------------------------------------
-   * ----------------
    */
-  // Your code here...
   void onPingTimer(PingTimer t) {
     if (isStable()) {
       sendConfigRequest(currentConfigNum + 1);
@@ -382,18 +300,95 @@ public class ShardStoreServer extends ShardStoreNode {
     }
   }
 
-  void onPrepareTimer(PrepareTimer t) {
-    if(t.request().configNum() == currentConfigNum && )
+  /*
+   * -----------------------------------------------------------------------------
+   * Transaction helpers
+   * -----------------------------------------------------------------------------
+   */
+
+  // Owner-tracked lock.  Re-entrant for the same AMOCommand so a duplicated
+  // PREPARE / coordinator request from a retrying sender doesn't spuriously
+  // fail.  Returns true iff the caller now holds the lock.
+  private boolean tryLock(AMOCommand cmd) {
+    if (lockHolder == null) {
+      lockHolder = cmd;
+      return true;
+    }
+    return lockHolder.equals(cmd);
+  }
+
+  private void releaseLock(AMOCommand cmd) {
+    if (cmd.equals(lockHolder)) {
+      lockHolder = null;
+    }
+  }
+
+  // For each key in the transaction, find which group currently owns it, per
+  // currentConfig.  Result is the set of groupIds that participate in 2PC.
+  private Set<Integer> participantsForTransaction(Transaction txn) {
+    Set<Integer> participants = new HashSet<>();
+    for (String key : txn.keySet()) {
+      int shardId = keyToShard(key);
+      for (var entry : currentConfig.entrySet()) {
+        if (entry.getValue().getRight().contains(shardId)) {
+          participants.add(entry.getKey());
+          break;
+        }
+      }
+    }
+    return participants;
+  }
+
+  // Run a transaction over the keys whose shards we own.  Used by the
+  // coordinator's single-group fast path now, and by the multi-group commit
+  // phase later (each participant will run this on its own subset).
+  private KVStoreResult executeTransactionOnOwnedShards(Transaction txn) {
+    Set<String> ourKeys = new HashSet<>();
+    for (String key : txn.keySet()) {
+      if (currentManagedShards.contains(keyToShard(key))) {
+        ourKeys.add(key);
+      }
+    }
+
+    // 1. Gather the current values for our keys into a single map.
+    Map<String, String> db = new HashMap<>();
+    for (String key : ourKeys) {
+      Map<String, String> shardStore = shardStoreFor(keyToShard(key));
+      if (shardStore.containsKey(key)) {
+        db.put(key, shardStore.get(key));
+      }
+    }
+
+    // 2. Run the transaction (mutates db for keys in writeSet()).
+    KVStoreResult result = txn.run(db);
+
+    // 3. Scatter writes back to the per-shard stores.
+    for (String key : txn.writeSet()) {
+      if (!ourKeys.contains(key)) continue;
+      Map<String, String> shardStore = shardStoreFor(keyToShard(key));
+      if (db.containsKey(key)) {
+        shardStore.put(key, db.get(key));
+      } else {
+        shardStore.remove(key);
+      }
+    }
+
+    return result;
+  }
+
+  // Reach into the per-shard TransactionalKVStore's underlying map.  Cast is
+  // safe because processNewConfig always installs a TransactionalKVStore.
+  private Map<String, String> shardStoreFor(int shardId) {
+    TransactionalKVStore tkvs =
+        (TransactionalKVStore) app.get(shardId).application();
+    return tkvs.store();
   }
 
   /*
    * -----------------------------------------------------------------------------
-   * ------------------
-   * Utils
+   * Utils (unchanged)
    * -----------------------------------------------------------------------------
-   * ----------------
    */
-  // Your code here...
   void sendConfigRequest(Integer configNum) {
     broadcastToShardMasters(new PaxosRequest(PAXOS_PING_ID, 0, new Query(configNum)));
   }
@@ -406,7 +401,6 @@ public class ShardStoreServer extends ShardStoreNode {
 
     for (Integer shardId : shardsToMove) {
       for (var entry : currentConfig.entrySet()) {
-        Integer key = entry.getKey();
         Pair<Set<Address>, Set<Integer>> value = entry.getValue();
         AMOApplication moveApp = app.get(shardId);
 
@@ -421,9 +415,7 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private boolean isStable() {
-    if (currentConfigNum == -1)
-      return true;
-
+    if (currentConfigNum == -1) return true;
     if (!currentConfig.containsKey(groupId)) {
       return currentManagedShards.isEmpty();
     }
@@ -432,12 +424,6 @@ public class ShardStoreServer extends ShardStoreNode {
 
   private void processKVRequest(ShardStoreRequest m) {
     AMOCommand command = (AMOCommand) m.command();
-    // Defense-in-depth: pre-checks in handleShardStoreRequest mean we should
-    // never enter this method with a mismatched config in single-server local
-    // paxos. In reference multi-server paxos a NewConfigCmd can be decided
-    // between propose and decide, so we still send a reply (rather than the
-    // old silent `return`) so the client never hangs waiting on a slot whose
-    // decision will never be re-delivered by paxos's dedup.
     if (m.configNum() != currentConfigNum) {
       send(new ShardStoreReply(currentConfigNum, null), command.address());
       if (m.configNum() > currentConfigNum) {
@@ -455,7 +441,6 @@ public class ShardStoreServer extends ShardStoreNode {
       return;
     }
     AMOResult result = app.get(shardId).execute(m.command());
-
     send(new ShardStoreReply(currentConfigNum, result), command.address());
   }
 
@@ -478,13 +463,10 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void processMoveReply(MoveReply m) {
-    // TODO: fix this
     if (m.configNum() > currentConfigNum) {
       sendConfigRequest(currentConfigNum + 1);
     }
-    if (m.configNum() != currentConfigNum) {
-      return;
-    }
+    if (m.configNum() != currentConfigNum) return;
     if (currentManagedShards.contains(m.shardId())) {
       currentManagedShards.remove(m.shardId());
       app.remove(m.shardId());
@@ -492,22 +474,20 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   void processNewConfig(ShardConfig newConfig) {
-    // TODO: fix this
-    if (newConfig.configNum() == currentConfigNum + 1) {
-      currentConfigNum = newConfig.configNum();
-      currentConfig = newConfig.groupInfo();
-      if (currentConfigNum == 0) {
-        if (currentConfig.containsKey(groupId)) {
-          currentManagedShards.addAll(currentConfig.get(groupId).getRight());
-          for (Integer shard : currentManagedShards) {
-            // TODO: have to make it transactionalKVStore
-            app.putIfAbsent(shard, new AMOApplication<>(new KVStore()));
-          }
+    if (newConfig.configNum() != currentConfigNum + 1) return;
+    currentConfigNum = newConfig.configNum();
+    currentConfig = newConfig.groupInfo();
+
+    if (currentConfigNum == 0) {
+      if (currentConfig.containsKey(groupId)) {
+        currentManagedShards.addAll(currentConfig.get(groupId).getRight());
+        for (Integer shard : currentManagedShards) {
+          // Use TransactionalKVStore so transactions can run on each shard.
+          app.putIfAbsent(shard, new AMOApplication<>(new TransactionalKVStore()));
         }
-      } else {
-        handleMove();
       }
+    } else {
+      handleMove();
     }
   }
-
 }

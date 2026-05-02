@@ -1,6 +1,5 @@
 package dslabs.shardkv;
 
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -9,31 +8,31 @@ import java.util.Set;
 
 import org.apache.commons.lang3.tuple.Pair;
 
-import com.google.common.base.Objects;
-
 import dslabs.framework.Address;
 import dslabs.framework.Client;
 import dslabs.framework.Command;
 import dslabs.framework.Result;
 import dslabs.atmostonce.AMOCommand;
 import dslabs.atmostonce.AMOResult;
-import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
-import static dslabs.shardkv.ClientTimer.CLIENT_RETRY_MILLIS;
-import dslabs.shardkv.ShardStoreReply;
-import dslabs.kvstore.KVStore.*;
-import dslabs.kvstore.TransactionalKVStore.*;
+import dslabs.kvstore.KVStore.Append;
+import dslabs.kvstore.KVStore.Get;
+import dslabs.kvstore.KVStore.Put;
+import dslabs.kvstore.KVStore.SingleKeyCommand;
+import dslabs.kvstore.TransactionalKVStore.Transaction;
 import dslabs.paxos.PaxosRequest;
 import dslabs.paxos.PaxosReply;
 import dslabs.shardmaster.ShardMaster.Query;
 import dslabs.shardmaster.ShardMaster.ShardConfig;
+
+import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
+import static dslabs.shardkv.ClientTimer.CLIENT_RETRY_MILLIS;
+
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
 public class ShardStoreClient extends ShardStoreNode implements Client {
-  // Your code here...
-
   private AMOCommand currentCommand;
   private Result result;
   private int currentConfigNum;
@@ -73,7 +72,9 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
   @Override
   public synchronized void sendCommand(Command command) {
     // Your code here...
-    if (!(command instanceof Get || command instanceof Put || command instanceof Append
+    if (!(command instanceof Get
+        || command instanceof Put
+        || command instanceof Append
         || command instanceof Transaction)) {
       throw new IllegalArgumentException();
     }
@@ -82,7 +83,6 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     result = null;
 
     set(new ClientTimer(sequenceNum), CLIENT_RETRY_MILLIS);
-
     sendPendingCommand();
   }
 
@@ -111,49 +111,68 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     if (currentCommand == null || result != null || currentConfigNum == -1) {
       return;
     }
-    if (command instanceof SingleKeyCommand) {
-      String key = ((SingleKeyCommand) currentCommand.command()).key();
-      Integer shardId = keyToShard(key);
-
-      for (var entry : currentConfig.entrySet()) {
-        if (entry.getValue().getRight().contains(shardId)) {
-          Address[] destination = entry.getValue().getLeft().toArray(new Address[0]);
-          ShardStoreRequest request = new ShardStoreRequest(currentConfigNum, key, currentCommand);
-          broadcast(request, destination);
-          return;
-        }
-      }
-    } else {
-      Set<String> keys = command.keySet();
-      Set<Integer> shardsIds = new HashSet<>();
-      for (String key : keys) {
-        shardsIds.add(keyToShard(key));
-      }
-      Set<Integer> groupIds;
-      for (var entry : currentConfig.entrySet()) {
-        if (!(Collections.disjoint(entry.getValue().getRight(), shardsIds))) {
-          groupIds.add(entry.getKey());
-        }
-      }
-      Integer groupId = Collections.min(groupIds);
-      Address[] destination = currentConfig.get(groupId).getLeft().toArray(new Address[0]);
-      ShardStoreRequest request = new ShardStoreRequest(currentConfigNum, "", currentCommand);
-      broadcast(request, destination);
-      return;
+    Command inner = currentCommand.command();
+    if (inner instanceof SingleKeyCommand) {
+      sendSingleKey((SingleKeyCommand) inner);
+    } else if (inner instanceof Transaction) {
+      sendTransaction((Transaction) inner);
     }
   }
 
+  private void sendSingleKey(SingleKeyCommand cmd) {
+    String key = cmd.key();
+    int shardId = keyToShard(key);
+    for (var entry : currentConfig.entrySet()) {
+      if (entry.getValue().getRight().contains(shardId)) {
+        Address[] dest = entry.getValue().getLeft().toArray(new Address[0]);
+        broadcast(new ShardStoreRequest(currentConfigNum, key, currentCommand), dest);
+        return;
+      }
+    }
+  }
+
+  // Send a transaction to the coordinator group only — defined as the lowest
+  // groupId among the participants (the groups owning at least one key in the
+  // transaction).  This matches the server-side coordinator check; sending
+  // to anyone else gets an immediate null reply.
+  private void sendTransaction(Transaction txn) {
+    Integer coordinator = coordinatorGroupId(txn);
+    if (coordinator == null) return;   // config doesn't yet cover all keys
+    Address[] dest = currentConfig.get(coordinator).getLeft().toArray(new Address[0]);
+    // key is irrelevant for a Transaction; pass null.
+    broadcast(new ShardStoreRequest(currentConfigNum, null, currentCommand), dest);
+  }
+
+  private Integer coordinatorGroupId(Transaction txn) {
+    Set<Integer> participants = new HashSet<>();
+    for (String key : txn.keySet()) {
+      int shardId = keyToShard(key);
+      Integer owner = ownerForShard(shardId);
+      if (owner == null) return null;
+      participants.add(owner);
+    }
+    if (participants.isEmpty()) return null;
+    return Collections.min(participants);
+  }
+
+  private Integer ownerForShard(int shardId) {
+    for (var entry : currentConfig.entrySet()) {
+      if (entry.getValue().getRight().contains(shardId)) {
+        return entry.getKey();
+      }
+    }
+    return null;
+  }
+
   private synchronized void handleShardStoreReply(ShardStoreReply m, Address sender) {
-    // Your code here...
     if (m.configNum() > currentConfigNum) {
-      // send getView to viewserver
       sendConfigRequest(-1);
       return;
     } else if (m.configNum() < currentConfigNum || m.result() == null) {
-      // TODO: send the command again quickly? fragile logic
+      // Wait for ClientTimer / PingTimer; do not fast-retry (see part-3 review).
       return;
     } else {
-      AMOResult res = (AMOResult) (m.result());
+      AMOResult res = m.result();
       if (currentCommand != null && result == null && res.sequenceNumber() == sequenceNum) {
         this.result = res.result();
         notify();
@@ -162,10 +181,7 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
   }
 
   void handlePaxosReply(PaxosReply m, Address sender) {
-    if (!(PAXOS_PING_ID.equals(m.id()))) {
-      // TODO: Do anything?
-      return;
-    }
+    if (!PAXOS_PING_ID.equals(m.id())) return;
     if (m.result() instanceof ShardConfig) {
       ShardConfig newConfig = (ShardConfig) m.result();
       if (newConfig.configNum() > currentConfigNum) {

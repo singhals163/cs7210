@@ -60,7 +60,15 @@ public class KVStore implements Application {
   }
 
   // Your code here...
-  private Map<String, String> store = new HashMap<>();
+  // protected so the TransactionalKVStore subclass can read/write directly,
+  // and exposed via store() so ShardStoreServer (different package) can
+  // gather/scatter when running a multi-shard transaction over its owned
+  // shards.
+  protected Map<String, String> store = new HashMap<>();
+
+  public Map<String, String> store() {
+    return store;
+  }
 
   @Override
   public KVStoreResult execute(Command command) {
