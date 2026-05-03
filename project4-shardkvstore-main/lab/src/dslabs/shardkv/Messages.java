@@ -20,6 +20,10 @@ final class ShardStoreRequest implements Message {
   private final Integer configNum;
   private final String key;
   private final AMOCommand command;
+  // Per-retry counter so each client retry gets a fresh paxos slot at the
+  // server (avoiding the dedup-drop where a previously-rejected processX has
+  // already consumed the slot for this (id, seqNum)).
+  private final int attempt;
 }
 
 @Data
@@ -49,6 +53,9 @@ final class PrepareTransactionRequest implements Message {
   private final Integer configNum;
   private final AMOCommand command;
   private final Address[] senders;
+  // Per-retry counter (incremented by coordinator's PrepareTimer) so each
+  // re-send to the participant gets a fresh paxos slot.
+  private final int attempt;
 }
 
 @Data
@@ -65,6 +72,9 @@ final class CommitTransactionRequest implements Message {
   private final AMOCommand command;
   private final Address[] senders;
   private final boolean commit;
+  // Per-retry counter (incremented by coordinator's CommitTimer) so each
+  // re-send to the participant gets a fresh paxos slot.
+  private final int attempt;
 }
 
 @Data

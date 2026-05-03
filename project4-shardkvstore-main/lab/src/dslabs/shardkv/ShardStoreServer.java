@@ -178,19 +178,35 @@ public class ShardStoreServer extends ShardStoreNode {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
 
-    // Pre-check BEFORE proposing to paxos.  Paxos dedups (id, seqNum); once a
-    // failed processX consumes a slot it can never re-fire, so a request that
-    // would fail the post-paxos check must be rejected here so the next
-    // client retry gets a fresh evaluation against the (eventually-changed)
-    // local state.
-    if (!coordinatorPreChecksPass(m, command, txn)) return;
-
+    // 1. Already-completed retries: serve from AMO cache, no paxos needed.
     AMOResult cached = txnAmoCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
       send(new ShardStoreReply(currentConfigNum, cached), command.address());
       return;
     }
-    String id = "txnClient-" + command.address() + "-" + currentConfigNum;
+
+    // 2. Already coordinating exactly this txn: client retry while we're
+    //    mid-2PC.  Don't re-propose; timers are driving the in-flight work
+    //    and the client will get its reply when finishCommit/finishAbort runs.
+    if (currentTxn != null && currentTxn.equals(command)) {
+      return;
+    }
+
+    // 3. Lock held by *another* command: reject directly so we don't burn a
+    //    paxos slot we know will fail.  Client will retry; eventually the
+    //    other txn finishes and our retry's pre-check passes.
+    if (lockHolder != null && !lockHolder.equals(command)) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+
+    // 4. Standard config / membership / shard-ownership pre-checks.
+    if (!coordinatorPreChecksPass(m, command, txn)) return;
+
+    // 5. Propose. attempt makes each client retry a fresh paxos slot so a
+    //    post-paxos rejection on a previous attempt doesn't dedup-drop us.
+    String id = "txnClient-" + command.address() + "-" + currentConfigNum
+        + "-" + m.attempt();
     handleMessage(new PaxosRequest(id, command.sequenceNumber(),
         new TxnClientReqCmd(m)), paxosAddress);
   }
@@ -280,7 +296,7 @@ public class ShardStoreServer extends ShardStoreNode {
       if (other == groupId) continue;
       Address[] dest = currentConfig.get(other).getLeft().toArray(new Address[0]);
       PrepareTransactionRequest req =
-          new PrepareTransactionRequest(currentConfigNum, command, group);
+          new PrepareTransactionRequest(currentConfigNum, command, group, 0);
       broadcast(req, dest);
       set(new PrepareTimer(dest, req), PREPARE_RETRY_MILLIS);
     }
@@ -323,7 +339,7 @@ public class ShardStoreServer extends ShardStoreNode {
       if (other == groupId) continue;
       Address[] dest = currentConfig.get(other).getLeft().toArray(new Address[0]);
       CommitTransactionRequest req =
-          new CommitTransactionRequest(currentConfigNum, currentTxn, group, true);
+          new CommitTransactionRequest(currentConfigNum, currentTxn, group, true, 0);
       broadcast(req, dest);
       set(new CommitTimer(dest, req), COMMIT_RETRY_MILLIS);
     }
@@ -347,7 +363,7 @@ public class ShardStoreServer extends ShardStoreNode {
       if (other == groupId) continue;
       Address[] dest = currentConfig.get(other).getLeft().toArray(new Address[0]);
       CommitTransactionRequest req =
-          new CommitTransactionRequest(currentConfigNum, currentTxn, group, false);
+          new CommitTransactionRequest(currentConfigNum, currentTxn, group, false, 0);
       broadcast(req, dest);
       set(new CommitTimer(dest, req), COMMIT_RETRY_MILLIS);
     }
@@ -426,9 +442,26 @@ public class ShardStoreServer extends ShardStoreNode {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
 
-    // Pre-check before proposing.  Reject (vote NO) directly if our local
-    // state can't honour this PREPARE; the coordinator's PrepareTimer will
-    // re-broadcast and the next attempt will be re-evaluated.
+    // 1. Already-committed txn: reply YES from cache, no paxos needed.
+    AMOResult cached = participantTxnCache.get(command.address());
+    if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      return;
+    }
+
+    // 2. Already prepared for this exact txn: re-vote YES, idempotent.
+    if (lockHolder != null && lockHolder.equals(command)) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      return;
+    }
+
+    // 3. Lock held by another txn: vote NO directly.
+    if (lockHolder != null) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      return;
+    }
+
+    // 4. Standard config / membership / shard-ownership pre-checks.
     if (m.configNum() != currentConfigNum) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
       if (m.configNum() > currentConfigNum) {
@@ -452,16 +485,9 @@ public class ShardStoreServer extends ShardStoreNode {
       return;
     }
 
-    // Already-committed txn: reply YES immediately so coordinator's COMMIT
-    // retry hits our cache.
-    AMOResult cached = participantTxnCache.get(command.address());
-    if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
-      return;
-    }
-
+    // 5. Propose.  attempt makes each coordinator retry a fresh paxos slot.
     String id = "txnPrep-" + command.address() + "-" + command.sequenceNumber()
-        + "-" + currentConfigNum;
+        + "-" + currentConfigNum + "-" + m.attempt();
     handleMessage(new PaxosRequest(id, currentConfigNum,
         new TxnPrepareReqCmd(m)), paxosAddress);
   }
@@ -536,7 +562,8 @@ public class ShardStoreServer extends ShardStoreNode {
     }
 
     String id = "txnCommit-" + command.address() + "-" + command.sequenceNumber()
-        + "-" + currentConfigNum + "-" + (m.commit() ? "C" : "A");
+        + "-" + currentConfigNum + "-" + (m.commit() ? "C" : "A")
+        + "-" + m.attempt();
     handleMessage(new PaxosRequest(id, currentConfigNum,
         new TxnCommitReqCmd(m)), paxosAddress);
   }
@@ -679,11 +706,18 @@ public class ShardStoreServer extends ShardStoreNode {
         || !currentTxn.equals(t.request().command())) {
       return;
     }
-    // Find the destination group to know if we already heard YES from it.
     Integer destGroup = groupForServers(t.destination());
     if (destGroup == null || txnPrepareYes.contains(destGroup)) return;
-    broadcast(t.request(), t.destination());
-    set(t, PREPARE_RETRY_MILLIS);
+
+    // Construct a fresh request with incremented attempt so the participant's
+    // paxos id is unique per retry — that way any post-paxos rejection on the
+    // previous attempt (e.g. transient lock conflict) doesn't dedup-drop the
+    // retry.
+    PrepareTransactionRequest old = t.request();
+    PrepareTransactionRequest next = new PrepareTransactionRequest(
+        old.configNum(), old.command(), old.senders(), old.attempt() + 1);
+    broadcast(next, t.destination());
+    set(new PrepareTimer(t.destination(), next), PREPARE_RETRY_MILLIS);
   }
 
   void onCommitTimer(CommitTimer t) {
@@ -692,8 +726,12 @@ public class ShardStoreServer extends ShardStoreNode {
     if (txnPhase != TxnPhase.COMMITTING && txnPhase != TxnPhase.ABORTING) return;
     Integer destGroup = groupForServers(t.destination());
     if (destGroup == null || txnAcks.contains(destGroup)) return;
-    broadcast(t.request(), t.destination());
-    set(t, COMMIT_RETRY_MILLIS);
+
+    CommitTransactionRequest old = t.request();
+    CommitTransactionRequest next = new CommitTransactionRequest(
+        old.configNum(), old.command(), old.senders(), old.commit(), old.attempt() + 1);
+    broadcast(next, t.destination());
+    set(new CommitTimer(t.destination(), next), COMMIT_RETRY_MILLIS);
   }
 
   /*

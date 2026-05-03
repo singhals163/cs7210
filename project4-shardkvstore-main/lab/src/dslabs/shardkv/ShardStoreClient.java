@@ -37,6 +37,11 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
   private Result result;
   private int currentConfigNum;
   private int sequenceNum;
+  // Per-command attempt counter — reset when sendCommand starts a new logical
+  // command; incremented in onClientTimer on every retry.  Server uses this in
+  // its paxos id so each retry gets a fresh paxos slot (no dedup-drop after a
+  // post-paxos rejection like a lock conflict).
+  private int attempt;
   private Map<Integer, Pair<Set<Address>, Set<Integer>>> currentConfig;
   private final String PAXOS_PING_ID;
 
@@ -81,6 +86,7 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     sequenceNum++;
     currentCommand = new AMOCommand(command, sequenceNum, this.address());
     result = null;
+    attempt = 0;
 
     set(new ClientTimer(sequenceNum), CLIENT_RETRY_MILLIS);
     sendPendingCommand();
@@ -125,7 +131,7 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     for (var entry : currentConfig.entrySet()) {
       if (entry.getValue().getRight().contains(shardId)) {
         Address[] dest = entry.getValue().getLeft().toArray(new Address[0]);
-        broadcast(new ShardStoreRequest(currentConfigNum, key, currentCommand), dest);
+        broadcast(new ShardStoreRequest(currentConfigNum, key, currentCommand, attempt), dest);
         return;
       }
     }
@@ -140,7 +146,7 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     if (coordinator == null) return;   // config doesn't yet cover all keys
     Address[] dest = currentConfig.get(coordinator).getLeft().toArray(new Address[0]);
     // key is irrelevant for a Transaction; pass null.
-    broadcast(new ShardStoreRequest(currentConfigNum, null, currentCommand), dest);
+    broadcast(new ShardStoreRequest(currentConfigNum, null, currentCommand, attempt), dest);
   }
 
   private Integer coordinatorGroupId(Transaction txn) {
@@ -202,8 +208,8 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
    * ----------------
    */
   private synchronized void onClientTimer(ClientTimer t) {
-    // Your code here...
     if (currentCommand != null && result == null && t.sequenceNum() == sequenceNum) {
+      attempt++;
       sendPendingCommand();
       set(t, CLIENT_RETRY_MILLIS);
     }
