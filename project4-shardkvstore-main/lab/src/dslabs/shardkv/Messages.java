@@ -5,6 +5,7 @@ import dslabs.framework.Message;
 import dslabs.framework.Result;
 import dslabs.framework.Application;
 import dslabs.framework.Address;
+import java.util.Map;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
@@ -64,6 +65,11 @@ final class PrepareTransactionReply implements Message {
   private final AMOCommand command;
   private final boolean result;
   private final Integer groupId;
+  // Values of the txn's readSet keys that map to shards we own.  Populated
+  // on a YES vote so the coord can assemble a full pre-image db across all
+  // shards.  Needed for cross-shard writes (e.g., Swap), where each
+  // participant's writes depend on values of keys it does *not* own.
+  private final Map<String, String> readValues;
 }
 
 @Data
@@ -75,6 +81,11 @@ final class CommitTransactionRequest implements Message {
   // Per-retry counter (incremented by coordinator's CommitTimer) so each
   // re-send to the participant gets a fresh paxos slot.
   private final int attempt;
+  // Aggregated readSet values from every participant (sent on commit=true).
+  // Lets each participant build a *full* pre-image db before running the
+  // txn locally, so cross-shard writes (Swap) compute correctly.  Null on
+  // commit=false (abort path doesn't need values).
+  private final Map<String, String> readValues;
 }
 
 @Data

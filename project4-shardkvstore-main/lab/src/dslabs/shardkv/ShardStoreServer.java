@@ -87,6 +87,10 @@ public class ShardStoreServer extends ShardStoreNode {
     Set<Integer> prepareYes = new HashSet<>();
     Set<Integer> acks = new HashSet<>();
     Map<Integer, KVStoreResult> partials = new HashMap<>();
+    // Aggregated readSet values from every participant who voted YES.  Used
+    // in beginCommitPhase to build a full pre-image db that includes values
+    // from shards we don't own (needed for Swap-style cross-shard writes).
+    Map<String, String> readValues = new HashMap<>();
   }
 
   private Map<AMOCommand, CoordState> activeTxns = new HashMap<>();
@@ -261,9 +265,10 @@ public class ShardStoreServer extends ShardStoreNode {
 
     Set<Integer> participants = participantsForTransaction(txn);
 
-    // Single-group fast path: skip 2PC.
+    // Single-group fast path: skip 2PC.  We own every touched key, so no
+    // external read values are needed.
     if (participants.size() == 1) {
-      KVStoreResult result = executeTransactionOnOwnedShards(txn);
+      KVStoreResult result = executeTransactionOnOwnedShards(txn, null);
       AMOResult amoResult = new AMOResult(command.sequenceNumber(), result);
       txnAmoCache.put(command.address(), amoResult);
       releaseLocks(command);
@@ -348,6 +353,11 @@ public class ShardStoreServer extends ShardStoreNode {
     // above (txn identity) is the correct staleness filter.
     if (m.result()) {
       st.prepareYes.add(m.groupId());
+      // Accumulate this participant's slice of the pre-image db; we'll need
+      // every YES voter's readSet values when running cross-shard txns.
+      if (m.readValues() != null) {
+        st.readValues.putAll(m.readValues());
+      }
       if (st.prepareYes.equals(st.participants)) {
         beginCommitPhase(m.command());
       }
@@ -364,7 +374,14 @@ public class ShardStoreServer extends ShardStoreNode {
     if (st == null) return;
 
     Transaction txn = (Transaction) command.command();
-    KVStoreResult ourPartial = executeTransactionOnOwnedShards(txn);
+
+    // Coordinator never sent itself a PREPARE, so its readSet values aren't
+    // in st.readValues yet.  Add them now to form the full pre-image db
+    // that gets shipped to every participant in COMMIT.
+    Map<String, String> fullReadValues = new HashMap<>(st.readValues);
+    fullReadValues.putAll(readLocalReadSetValues(txn));
+
+    KVStoreResult ourPartial = executeTransactionOnOwnedShards(txn, fullReadValues);
     st.partials.put(groupId, ourPartial);
 
     st.phase = TxnPhase.COMMITTING;
@@ -374,7 +391,8 @@ public class ShardStoreServer extends ShardStoreNode {
       if (other == groupId) continue;
       Address[] dest = currentConfig.get(other).getLeft().toArray(new Address[0]);
       CommitTransactionRequest req =
-          new CommitTransactionRequest(currentConfigNum, command, group, true, 0);
+          new CommitTransactionRequest(currentConfigNum, command, group, true, 0,
+              fullReadValues);
       broadcast(req, dest);
       set(new CommitTimer(dest, req), COMMIT_RETRY_MILLIS);
     }
@@ -398,8 +416,9 @@ public class ShardStoreServer extends ShardStoreNode {
     for (Integer other : st.participants) {
       if (other == groupId) continue;
       Address[] dest = currentConfig.get(other).getLeft().toArray(new Address[0]);
+      // ABORT carries no read values — participant just releases locks.
       CommitTransactionRequest req =
-          new CommitTransactionRequest(currentConfigNum, command, group, false, 0);
+          new CommitTransactionRequest(currentConfigNum, command, group, false, 0, null);
       broadcast(req, dest);
       set(new CommitTimer(dest, req), COMMIT_RETRY_MILLIS);
     }
@@ -479,7 +498,7 @@ public class ShardStoreServer extends ShardStoreNode {
     // 1. Already-committed txn: reply YES from cache, no paxos needed.
     AMOResult cached = participantTxnCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId, readLocalReadSetValues(txn)), m.senders());
       return;
     }
 
@@ -491,7 +510,7 @@ public class ShardStoreServer extends ShardStoreNode {
     //    on before the config change arrived would get a NO on its retry and
     //    abort unnecessarily.
     if (weHoldKeys(command, myKeys)) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId, readLocalReadSetValues(txn)), m.senders());
       return;
     }
 
@@ -499,30 +518,30 @@ public class ShardStoreServer extends ShardStoreNode {
     //    will see NO and abort; client retries; on the new config the txn
     //    runs cleanly.
     if (pendingConfigChange) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
 
     // 4. Per-key conflict with another txn: vote NO directly.
     if (!canLockKeys(command, myKeys)) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
 
     // 4. Standard config / membership / shard-ownership pre-checks.
     if (m.configNum() != currentConfigNum) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       if (m.configNum() > currentConfigNum) {
         sendConfigRequest(currentConfigNum + 1);
       }
       return;
     }
     if (currentConfig == null || !currentConfig.containsKey(groupId) || !isStable()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
     if (myKeys.isEmpty()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
 
@@ -538,20 +557,20 @@ public class ShardStoreServer extends ShardStoreNode {
     Transaction txn = (Transaction) command.command();
 
     if (m.configNum() != currentConfigNum) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       if (m.configNum() > currentConfigNum) {
         sendConfigRequest(currentConfigNum + 1);
       }
       return;
     }
     if (currentConfig == null || !currentConfig.containsKey(groupId) || !isStable()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
 
     Set<String> myKeys = ourKeysFor(txn);
     if (myKeys.isEmpty()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
       return;
     }
 
@@ -559,14 +578,14 @@ public class ShardStoreServer extends ShardStoreNode {
     // our cache.
     AMOResult cached = participantTxnCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId, readLocalReadSetValues(txn)), m.senders());
       return;
     }
 
     if (tryLockKeys(command, myKeys)) {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId, readLocalReadSetValues(txn)), m.senders());
     } else {
-      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId, null), m.senders());
     }
   }
 
@@ -634,7 +653,9 @@ public class ShardStoreServer extends ShardStoreNode {
     if (m.commit()) {
       Set<String> myKeys = ourKeysFor(txn);
       if (weHoldKeys(command, myKeys)) {
-        KVStoreResult partial = executeTransactionOnOwnedShards(txn);
+        // Use the coord's aggregated readValues so cross-shard writes (Swap)
+        // see values from shards we don't own.
+        KVStoreResult partial = executeTransactionOnOwnedShards(txn, m.readValues());
         AMOResult amoResult = new AMOResult(command.sequenceNumber(), partial);
         participantTxnCache.put(command.address(), amoResult);
         releaseLocks(command);
@@ -778,8 +799,11 @@ public class ShardStoreServer extends ShardStoreNode {
     if (destGroup == null || st.acks.contains(destGroup)) return;
 
     CommitTransactionRequest old = t.request();
+    // Forward the same readValues — they're computed once at the start of
+    // beginCommitPhase and don't change across retries.
     CommitTransactionRequest next = new CommitTransactionRequest(
-        old.configNum(), old.command(), old.senders(), old.commit(), old.attempt() + 1);
+        old.configNum(), old.command(), old.senders(), old.commit(),
+        old.attempt() + 1, old.readValues());
     broadcast(next, t.destination());
     set(new CommitTimer(t.destination(), next), COMMIT_RETRY_MILLIS);
   }
@@ -872,10 +896,15 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   // Run the transaction over keys whose shard we currently own.  Used by:
-  //   - the coordinator's single-group fast path (we own all keys), and
-  //   - both coordinator and participants in multi-group commit (each runs
-  //     on its own subset; the coordinator merges).
-  private KVStoreResult executeTransactionOnOwnedShards(Transaction txn) {
+  //   - the coordinator's single-group fast path (we own all keys, pass null
+  //     for externalReadValues), and
+  //   - both coordinator and participants in multi-group commit, where the
+  //     coordinator first aggregates readSet values from every participant
+  //     and ships them via `externalReadValues` so cross-shard writes (Swap)
+  //     can compute correctly.  Each participant still only writes back to
+  //     its own keys.
+  private KVStoreResult executeTransactionOnOwnedShards(
+      Transaction txn, Map<String, String> externalReadValues) {
     Set<String> ourKeys = new HashSet<>();
     for (String key : txn.keySet()) {
       if (currentManagedShards.contains(keyToShard(key))) {
@@ -883,11 +912,19 @@ public class ShardStoreServer extends ShardStoreNode {
       }
     }
 
+    // Build a full pre-image db: start with externally-supplied values from
+    // other participants' shards, then overlay our own current values (so
+    // local state is authoritative for keys we own).
     Map<String, String> db = new HashMap<>();
+    if (externalReadValues != null) {
+      db.putAll(externalReadValues);
+    }
     for (String key : ourKeys) {
       Map<String, String> shardStore = shardStoreFor(keyToShard(key));
       if (shardStore.containsKey(key)) {
         db.put(key, shardStore.get(key));
+      } else {
+        db.remove(key);
       }
     }
 
@@ -903,6 +940,22 @@ public class ShardStoreServer extends ShardStoreNode {
       }
     }
     return result;
+  }
+
+  // Read this server's local values for the txn's readSet keys that map to
+  // shards we currently own.  Used by participants to ship their slice of
+  // the pre-image db to the coordinator on PREPARE.
+  private Map<String, String> readLocalReadSetValues(Transaction txn) {
+    Map<String, String> values = new HashMap<>();
+    for (String key : txn.readSet()) {
+      int shardId = keyToShard(key);
+      if (!currentManagedShards.contains(shardId)) continue;
+      Map<String, String> shardStore = shardStoreFor(shardId);
+      if (shardStore.containsKey(key)) {
+        values.put(key, shardStore.get(key));
+      }
+    }
+    return values;
   }
 
   private Map<String, String> shardStoreFor(int shardId) {
