@@ -707,14 +707,15 @@ public class ShardStoreServer extends ShardStoreNode {
     if (m.result() instanceof ShardConfig) {
       ShardConfig newConfig = (ShardConfig) m.result();
       updateMaxConfigNum(newConfig.configNum());
-      if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
-        if (canApplyConfigChange()) {
-          // Idle: propose immediately.
+      if (newConfig.configNum() == currentConfigNum + 1) {
+        if (isStable() && canApplyConfigChange()) {
+          // Idle and stable: propose immediately.
           handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
               newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
         } else {
-          // In-flight transaction(s) — defer.  maybeTriggerPendingConfigChange
-          // will propose once those finish and release their locks.
+          // Either mid-move (!isStable) or in-flight txn (locks held).  Stash
+          // it; we apply once both conditions clear (see
+          // maybeTriggerPendingConfigChange, called from move/txn completion).
           pendingConfigChange = true;
           pendingConfig = newConfig;
         }
@@ -751,9 +752,11 @@ public class ShardStoreServer extends ShardStoreNode {
    * -----------------------------------------------------------------------------
    */
   void onPingTimer(PingTimer t) {
-    if (isStable()) {
-      sendConfigRequest(currentConfigNum + 1);
-    }
+    // Always query — even mid-move.  We need to *learn* about new configs as
+    // soon as they're cut so we don't fall behind under constant
+    // reconfiguration.  The reply handler stashes the result and applies it
+    // only when we're actually stable + idle.
+    sendConfigRequest(currentConfigNum + 1);
     set(t, PING_RETRY_MILLIS);
   }
 
@@ -883,10 +886,13 @@ public class ShardStoreServer extends ShardStoreNode {
     }
   }
 
-  // Called after every lock release / activeTxns removal — if a config change
-  // was deferred and we're now idle, fire the proposal.
+  // Called after every lock release / activeTxns removal AND after every
+  // shard move completion — if a config change was deferred and we're now
+  // both idle (no locks/txns) and stable (no pending moves), fire the
+  // proposal.
   private void maybeTriggerPendingConfigChange() {
-    if (pendingConfigChange && pendingConfig != null && canApplyConfigChange()) {
+    if (pendingConfigChange && pendingConfig != null
+        && canApplyConfigChange() && isStable()) {
       ShardConfig cfg = pendingConfig;
       // NB: do NOT clear `pendingConfigChange` yet.  We keep blocking new
       // client work until processNewConfig actually applies; the flag is
@@ -1062,6 +1068,9 @@ public class ShardStoreServer extends ShardStoreNode {
         currentManagedShards.add(m.shardId());
       }
       broadcast(new MoveReply(currentConfigNum, m.shardId()), m.senders());
+      // We just gained a shard — may have become stable; if a config change
+      // was deferred waiting for stability, fire it now.
+      maybeTriggerPendingConfigChange();
     }
   }
 
@@ -1073,6 +1082,9 @@ public class ShardStoreServer extends ShardStoreNode {
     if (currentManagedShards.contains(m.shardId())) {
       currentManagedShards.remove(m.shardId());
       app.remove(m.shardId());
+      // We just gave away a shard — may have become stable; if a config
+      // change was deferred waiting for stability, fire it now.
+      maybeTriggerPendingConfigChange();
     }
   }
 
