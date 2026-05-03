@@ -176,6 +176,15 @@ public class ShardStoreServer extends ShardStoreNode {
   // log slot.  AMO cache fast-path stays here (avoids paxos for retries).
   private void handleShardStoreCoordinator(ShardStoreRequest m, Address sender) {
     AMOCommand command = m.command();
+    Transaction txn = (Transaction) command.command();
+
+    // Pre-check BEFORE proposing to paxos.  Paxos dedups (id, seqNum); once a
+    // failed processX consumes a slot it can never re-fire, so a request that
+    // would fail the post-paxos check must be rejected here so the next
+    // client retry gets a fresh evaluation against the (eventually-changed)
+    // local state.
+    if (!coordinatorPreChecksPass(m, command, txn)) return;
+
     AMOResult cached = txnAmoCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
       send(new ShardStoreReply(currentConfigNum, cached), command.address());
@@ -415,11 +424,42 @@ public class ShardStoreServer extends ShardStoreNode {
   // already-committed retries.
   private void handlePrepareTransactionRequest(PrepareTransactionRequest m, Address sender) {
     AMOCommand command = m.command();
+    Transaction txn = (Transaction) command.command();
+
+    // Pre-check before proposing.  Reject (vote NO) directly if our local
+    // state can't honour this PREPARE; the coordinator's PrepareTimer will
+    // re-broadcast and the next attempt will be re-evaluated.
+    if (m.configNum() != currentConfigNum) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      if (m.configNum() > currentConfigNum) {
+        sendConfigRequest(currentConfigNum + 1);
+      }
+      return;
+    }
+    if (currentConfig == null || !currentConfig.containsKey(groupId) || !isStable()) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      return;
+    }
+    boolean involved = false;
+    for (String key : txn.keySet()) {
+      if (currentManagedShards.contains(keyToShard(key))) {
+        involved = true;
+        break;
+      }
+    }
+    if (!involved) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      return;
+    }
+
+    // Already-committed txn: reply YES immediately so coordinator's COMMIT
+    // retry hits our cache.
     AMOResult cached = participantTxnCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
       return;
     }
+
     String id = "txnPrep-" + command.address() + "-" + command.sequenceNumber()
         + "-" + currentConfigNum;
     handleMessage(new PaxosRequest(id, currentConfigNum,
@@ -472,10 +512,19 @@ public class ShardStoreServer extends ShardStoreNode {
 
   // Thin wrapper: route the COMMIT/ABORT through paxos so all replicas in the
   // participant group apply the transaction's writes (or release the lock) at
-  // the same paxos slot.  Cache fast-path replies straight away on a duplicate
-  // COMMIT for an already-committed transaction.
+  // the same paxos slot.
   private void handleCommitTransactionRequest(CommitTransactionRequest m, Address sender) {
     AMOCommand command = m.command();
+
+    // Pre-check before proposing.  Stale config: ack directly so the
+    // coordinator can drop us and we don't burn a paxos slot on a no-op.
+    if (m.configNum() != currentConfigNum) {
+      broadcast(new CommitTransactionReply(
+          currentConfigNum, command, m.commit(), groupId, null), m.senders());
+      return;
+    }
+
+    // Already-committed COMMIT: reply from cache, no need to re-execute.
     if (m.commit()) {
       AMOResult cached = participantTxnCache.get(command.address());
       if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
@@ -485,6 +534,7 @@ public class ShardStoreServer extends ShardStoreNode {
         return;
       }
     }
+
     String id = "txnCommit-" + command.address() + "-" + command.sequenceNumber()
         + "-" + currentConfigNum + "-" + (m.commit() ? "C" : "A");
     handleMessage(new PaxosRequest(id, currentConfigNum,
