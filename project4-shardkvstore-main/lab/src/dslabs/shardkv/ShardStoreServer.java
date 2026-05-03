@@ -442,7 +442,7 @@ public class ShardStoreServer extends ShardStoreNode {
       AMOResult cached = participantTxnCache.get(command.address());
       if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
         broadcast(new CommitTransactionReply(
-            currentConfigNum, command, true, groupId, cached.result()), m.senders());
+            currentConfigNum, command, true, groupId, (KVStoreResult)cached.result()), m.senders());
         return;
       }
       if (command.equals(lockHolder)) {

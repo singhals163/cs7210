@@ -12,6 +12,7 @@ import dslabs.atmostonce.AMOApplication;
 import dslabs.atmostonce.AMOCommand;
 import dslabs.atmostonce.AMOResult;
 import dslabs.shardmaster.ShardMaster.ShardConfig;
+import dslabs.kvstore.KVStore.KVStoreResult;
 
 @Data
 final class ShardStoreRequest implements Message {
@@ -72,7 +73,7 @@ final class CommitTransactionReply implements Message {
   private final AMOCommand command;
   private final boolean committed;
   private final Integer groupId;
-  private final dslabs.kvstore.KVStore.KVStoreResult partialResult;
+  private final KVStoreResult partialResult;
 }
 
 @Data
