@@ -91,6 +91,15 @@ public class ShardStoreServer extends ShardStoreNode {
 
   private Map<AMOCommand, CoordState> activeTxns = new HashMap<>();
 
+  // Deferred reconfiguration: when a new ShardConfig arrives but we still have
+  // locks held / transactions in flight, we can't safely apply it yet (would
+  // either lose writes from in-flight commits or diverge replicas if some
+  // applied at different times).  Stash here and re-check after every lock
+  // release / txn completion.  Stays set until processNewConfig actually
+  // applies, so the pre-paxos-decide window also blocks new client work.
+  private boolean pendingConfigChange = false;
+  private ShardConfig pendingConfig = null;
+
   /*
    * -----------------------------------------------------------------------------
    * Construction and Initialization
@@ -196,7 +205,16 @@ public class ShardStoreServer extends ShardStoreNode {
       return;
     }
 
-    // 3. Per-key conflict: any of our keys held by a *different* txn.  Reject
+    // 3. A config change is waiting to apply — don't admit any new client
+    //    transactions, so existing ones can drain and the deferred change
+    //    can fire.  Client retries; once we're past the change it'll succeed
+    //    against the new config.
+    if (pendingConfigChange) {
+      send(new ShardStoreReply(currentConfigNum, null), command.address());
+      return;
+    }
+
+    // 4. Per-key conflict: any of our keys held by a *different* txn.  Reject
     //    directly so we don't burn a paxos slot we know will fail.
     Set<String> myKeys = ourKeysFor(txn);
     if (!canLockKeys(command, myKeys)) {
@@ -250,6 +268,7 @@ public class ShardStoreServer extends ShardStoreNode {
       txnAmoCache.put(command.address(), amoResult);
       releaseLocks(command);
       send(new ShardStoreReply(currentConfigNum, amoResult), command.address());
+      maybeTriggerPendingConfigChange();
       return;
     }
 
@@ -420,12 +439,14 @@ public class ShardStoreServer extends ShardStoreNode {
     activeTxns.remove(command);
     releaseLocks(command);
     send(new ShardStoreReply(currentConfigNum, amoResult), command.address());
+    maybeTriggerPendingConfigChange();
   }
 
   private void finishAbort(AMOCommand command) {
     activeTxns.remove(command);
     releaseLocks(command);
     // Null reply was already sent at the start of beginAbortPhase.
+    maybeTriggerPendingConfigChange();
   }
 
   /*
@@ -451,13 +472,24 @@ public class ShardStoreServer extends ShardStoreNode {
     Set<String> myKeys = ourKeysFor(txn);
 
     // 2. Already prepared for this exact txn (we hold all our keys for it):
-    //    re-vote YES, idempotent.
+    //    re-vote YES, idempotent.  This *must* be checked before the pending-
+    //    config-change check below, otherwise a transaction that we voted YES
+    //    on before the config change arrived would get a NO on its retry and
+    //    abort unnecessarily.
     if (weHoldKeys(command, myKeys)) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
       return;
     }
 
-    // 3. Per-key conflict with another txn: vote NO directly.
+    // 3. A config change is waiting — don't accept any new PREPAREs.  Coord
+    //    will see NO and abort; client retries; on the new config the txn
+    //    runs cleanly.
+    if (pendingConfigChange) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
+      return;
+    }
+
+    // 4. Per-key conflict with another txn: vote NO directly.
     if (!canLockKeys(command, myKeys)) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
       return;
@@ -582,6 +614,7 @@ public class ShardStoreServer extends ShardStoreNode {
         releaseLocks(command);
         broadcast(new CommitTransactionReply(
             currentConfigNum, command, true, groupId, partial), m.senders());
+        maybeTriggerPendingConfigChange();
         return;
       }
       // Defensive: not in cache, don't hold the per-key locks — just ack with
@@ -592,6 +625,7 @@ public class ShardStoreServer extends ShardStoreNode {
       releaseLocks(command);
       broadcast(new CommitTransactionReply(
           currentConfigNum, command, false, groupId, null), m.senders());
+      maybeTriggerPendingConfigChange();
     }
   }
 
@@ -635,8 +669,16 @@ public class ShardStoreServer extends ShardStoreNode {
     if (m.result() instanceof ShardConfig) {
       ShardConfig newConfig = (ShardConfig) m.result();
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
-        handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
-            newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
+        if (canApplyConfigChange()) {
+          // Idle: propose immediately.
+          handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
+              newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
+        } else {
+          // In-flight transaction(s) — defer.  maybeTriggerPendingConfigChange
+          // will propose once those finish and release their locks.
+          pendingConfigChange = true;
+          pendingConfig = newConfig;
+        }
       }
     }
   }
@@ -766,6 +808,27 @@ public class ShardStoreServer extends ShardStoreNode {
 
   private void releaseLocks(AMOCommand cmd) {
     keyLocks.entrySet().removeIf(e -> cmd.equals(e.getValue()));
+  }
+
+  // ----- Deferred-reconfiguration helpers -----
+
+  // Safe to apply a config change right now iff there are no in-flight txns
+  // (no coordinator state, no per-key locks held).
+  private boolean canApplyConfigChange() {
+    return keyLocks.isEmpty() && activeTxns.isEmpty();
+  }
+
+  // Called after every lock release / activeTxns removal — if a config change
+  // was deferred and we're now idle, fire the proposal.
+  private void maybeTriggerPendingConfigChange() {
+    if (pendingConfigChange && pendingConfig != null && canApplyConfigChange()) {
+      ShardConfig cfg = pendingConfig;
+      // NB: do NOT clear `pendingConfigChange` yet.  We keep blocking new
+      // client work until processNewConfig actually applies; the flag is
+      // cleared there.
+      handleMessage(new PaxosRequest("newConfig-" + cfg.configNum(),
+          cfg.configNum(), new NewConfigCmd(cfg)), paxosAddress);
+    }
   }
 
   private Set<Integer> participantsForTransaction(Transaction txn) {
@@ -952,6 +1015,10 @@ public class ShardStoreServer extends ShardStoreNode {
     if (newConfig.configNum() != currentConfigNum + 1) return;
     currentConfigNum = newConfig.configNum();
     currentConfig = newConfig.groupInfo();
+
+    // Whatever we were deferring is now applied (or never matched anyway).
+    pendingConfigChange = false;
+    pendingConfig = null;
 
     if (currentConfigNum == 0) {
       if (currentConfig.containsKey(groupId)) {
