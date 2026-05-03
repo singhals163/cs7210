@@ -6,11 +6,7 @@ import lombok.Data;
 
 @Data
 final class ClientTimer implements Timer {
-  // Range, not a fixed interval, so concurrent clients don't fire in lockstep
-  // and starve each other on the coordinator's lock.  Each call to
-  // set(timer, MIN, MAX) picks a uniform random delay in [MIN, MAX].
-  static final int CLIENT_MIN_RETRY_MILLIS = 75;
-  static final int CLIENT_MAX_RETRY_MILLIS = 250;
+  static final int CLIENT_RETRY_MILLIS = 100;
 
   // Your code here...
   private final int sequenceNum;

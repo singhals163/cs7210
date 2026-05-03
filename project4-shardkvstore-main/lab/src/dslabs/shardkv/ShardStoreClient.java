@@ -25,8 +25,7 @@ import dslabs.shardmaster.ShardMaster.Query;
 import dslabs.shardmaster.ShardMaster.ShardConfig;
 
 import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
-import static dslabs.shardkv.ClientTimer.CLIENT_MIN_RETRY_MILLIS;
-import static dslabs.shardkv.ClientTimer.CLIENT_MAX_RETRY_MILLIS;
+import static dslabs.shardkv.ClientTimer.CLIENT_RETRY_MILLIS;
 
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
@@ -89,12 +88,8 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     result = null;
     attempt = 0;
 
-    // Do NOT broadcast immediately.  Setting the timer here and waiting for it
-    // to fire gives every concurrent client the same per-command cadence —
-    // otherwise a client that just succeeded would re-send right after the
-    // server's lock released, beating other clients whose retries are still
-    // 100 ms away from their next ClientTimer fire and starving them.
-    set(new ClientTimer(sequenceNum), CLIENT_MIN_RETRY_MILLIS, CLIENT_MAX_RETRY_MILLIS);
+    set(new ClientTimer(sequenceNum), CLIENT_RETRY_MILLIS);
+    sendPendingCommand();
   }
 
   @Override
@@ -216,7 +211,7 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     if (currentCommand != null && result == null && t.sequenceNum() == sequenceNum) {
       attempt++;
       sendPendingCommand();
-      set(t, CLIENT_MIN_RETRY_MILLIS, CLIENT_MAX_RETRY_MILLIS);
+      set(t, CLIENT_RETRY_MILLIS);
     }
   }
 
