@@ -337,8 +337,15 @@ public class ShardStoreServer extends ShardStoreNode {
   private void processPrepareTransactionReply(PrepareTransactionReply m) {
     CoordState st = activeTxns.get(m.command());
     if (st == null || st.phase != TxnPhase.PREPARING) return;
-    if (m.configNum() != currentConfigNum) return;
 
+    // We do *not* gate this on m.configNum() == currentConfigNum.  A
+    // participant that voted NO might already have advanced to a newer config
+    // (it didn't acquire any lock for this txn, so its `canApply` became true
+    // and it applied a deferred config change).  Its NO would carry the new
+    // configNum.  We still must process it — otherwise coord stays in
+    // PREPARING forever, T_a never aborts, the coord's pending config change
+    // never fires, and the client hangs indefinitely.  The activeTxns lookup
+    // above (txn identity) is the correct staleness filter.
     if (m.result()) {
       st.prepareYes.add(m.groupId());
       if (st.prepareYes.equals(st.participants)) {
@@ -414,9 +421,16 @@ public class ShardStoreServer extends ShardStoreNode {
   private void processCommitTransactionReply(CommitTransactionReply m) {
     CoordState st = activeTxns.get(m.command());
     if (st == null) return;                                // stale or unknown
-    if (m.configNum() != currentConfigNum) return;
     if (st.phase != TxnPhase.COMMITTING && st.phase != TxnPhase.ABORTING) return;
 
+    // No configNum gate here either: in ABORTING we may receive acks from
+    // participants who advanced to a newer config (they had no lock for this
+    // txn and hit `canApply==true`).  Dropping their acks would strand coord
+    // forever waiting on participants whose mailboxes are already empty.
+    // For COMMITTING, participants have locks that prevent them from
+    // advancing while we're in flight, so configNums *should* match
+    // naturally — but we don't enforce it here either; activeTxns identity
+    // is the staleness filter.
     st.acks.add(m.groupId());
     if (st.phase == TxnPhase.COMMITTING && m.partialResult() != null) {
       st.partials.put(m.groupId(), m.partialResult());
