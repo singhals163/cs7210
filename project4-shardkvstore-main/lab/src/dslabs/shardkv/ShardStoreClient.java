@@ -88,8 +88,12 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
     result = null;
     attempt = 0;
 
+    // Do NOT broadcast immediately.  Setting the timer here and waiting for it
+    // to fire gives every concurrent client the same per-command cadence —
+    // otherwise a client that just succeeded would re-send right after the
+    // server's lock released, beating other clients whose retries are still
+    // 100 ms away from their next ClientTimer fire and starving them.
     set(new ClientTimer(sequenceNum), CLIENT_RETRY_MILLIS);
-    sendPendingCommand();
   }
 
   @Override
