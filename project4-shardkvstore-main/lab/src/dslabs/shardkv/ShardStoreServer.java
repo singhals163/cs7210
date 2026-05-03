@@ -100,6 +100,14 @@ public class ShardStoreServer extends ShardStoreNode {
   private boolean pendingConfigChange = false;
   private ShardConfig pendingConfig = null;
 
+  // Highest configNum we've *ever* observed — from a shardmaster reply OR
+  // from any incoming message that carries a configNum (client request,
+  // PREPARE/COMMIT request from a peer group, MoveRequest, etc.).  We use
+  // this purely to know "the world has moved past us" so we keep refusing
+  // new client work and keep driving catch-up.  Updated proactively so we
+  // don't have to wait for the next PingTimer to discover that we're behind.
+  private int maxConfigNum = -1;
+
   /*
    * -----------------------------------------------------------------------------
    * Construction and Initialization
@@ -192,6 +200,7 @@ public class ShardStoreServer extends ShardStoreNode {
   private void handleShardStoreCoordinator(ShardStoreRequest m, Address sender) {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
+    updateMaxConfigNum(m.configNum());
 
     // 1. Already-completed retries: serve from AMO cache, no paxos needed.
     AMOResult cached = txnAmoCache.get(command.address());
@@ -205,11 +214,11 @@ public class ShardStoreServer extends ShardStoreNode {
       return;
     }
 
-    // 3. A config change is waiting to apply — don't admit any new client
-    //    transactions, so existing ones can drain and the deferred change
-    //    can fire.  Client retries; once we're past the change it'll succeed
-    //    against the new config.
-    if (pendingConfigChange) {
+    // 3. We're behind on configs — either we have a deferred config change
+    //    pending, or we've heard about a newer config from the client / a
+    //    peer / the shardmaster.  Don't admit new client transactions so the
+    //    in-flight ones can drain and we can advance.
+    if (isReconfiguring() || pendingConfigChange) {
       send(new ShardStoreReply(currentConfigNum, null), command.address());
       return;
     }
@@ -328,6 +337,7 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handlePrepareTransactionReply(PrepareTransactionReply m, Address sender) {
+    updateMaxConfigNum(m.configNum());
     String id = "txnPrepReply-" + m.command().address() + "-" + m.command().sequenceNumber()
         + "-" + m.groupId() + "-" + currentConfigNum;
     handleMessage(new PaxosRequest(id, currentConfigNum,
@@ -412,6 +422,7 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handleCommitTransactionReply(CommitTransactionReply m, Address sender) {
+    updateMaxConfigNum(m.configNum());
     String id = "txnCommitReply-" + m.command().address() + "-" + m.command().sequenceNumber()
         + "-" + m.groupId() + "-" + currentConfigNum;
     handleMessage(new PaxosRequest(id, currentConfigNum,
@@ -475,6 +486,7 @@ public class ShardStoreServer extends ShardStoreNode {
   private void handlePrepareTransactionRequest(PrepareTransactionRequest m, Address sender) {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
+    updateMaxConfigNum(m.configNum());
 
     // 1. Already-committed txn: reply YES from cache, no paxos needed.
     AMOResult cached = participantTxnCache.get(command.address());
@@ -485,20 +497,17 @@ public class ShardStoreServer extends ShardStoreNode {
 
     Set<String> myKeys = ourKeysFor(txn);
 
-    // 2. Already prepared for this exact txn (we hold all our keys for it):
-    //    re-vote YES, idempotent.  This *must* be checked before the pending-
-    //    config-change check below, otherwise a transaction that we voted YES
-    //    on before the config change arrived would get a NO on its retry and
-    //    abort unnecessarily.
+    // 2. Already prepared for this exact txn: re-vote YES, idempotent.  Must
+    //    come before the reconfiguring check — a txn we already voted YES on
+    //    must keep getting YES on retries even if a config change is pending.
     if (weHoldKeys(command, myKeys)) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
       return;
     }
 
-    // 3. A config change is waiting — don't accept any new PREPAREs.  Coord
-    //    will see NO and abort; client retries; on the new config the txn
-    //    runs cleanly.
-    if (pendingConfigChange) {
+    // 3. We're behind on configs — refuse new PREPAREs.  Coord will see NO,
+    //    abort, client retries; once we've caught up the txn runs cleanly.
+    if (isReconfiguring() || pendingConfigChange) {
       broadcast(new PrepareTransactionReply(currentConfigNum, command, false, groupId), m.senders());
       return;
     }
@@ -575,16 +584,15 @@ public class ShardStoreServer extends ShardStoreNode {
   // the same paxos slot.
   private void handleCommitTransactionRequest(CommitTransactionRequest m, Address sender) {
     AMOCommand command = m.command();
+    updateMaxConfigNum(m.configNum());
 
-    // Pre-check before proposing.  Stale config: ack directly so the
-    // coordinator can drop us and we don't burn a paxos slot on a no-op.
-    if (m.configNum() != currentConfigNum) {
-      broadcast(new CommitTransactionReply(
-          currentConfigNum, command, m.commit(), groupId, null), m.senders());
-      return;
-    }
-
-    // Already-committed COMMIT: reply from cache, no need to re-execute.
+    // Already-committed COMMIT: reply with cached partial regardless of
+    // configNum.  This MUST come before the configNum check — once we've
+    // executed and cached a partial result, a retry that arrives after we've
+    // advanced to a newer config still owes the coordinator the *original*
+    // partial.  Replying with `partial=null` here would silently drop the
+    // participant's contribution from `mergePartials` and produce KeyNotFound
+    // values for keys that were actually written.
     if (m.commit()) {
       AMOResult cached = participantTxnCache.get(command.address());
       if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
@@ -593,6 +601,14 @@ public class ShardStoreServer extends ShardStoreNode {
             (KVStoreResult) cached.result()), m.senders());
         return;
       }
+    }
+
+    // Stale config (and not in our cache): ack directly so the coordinator
+    // can drop us; we don't burn a paxos slot on a no-op.
+    if (m.configNum() != currentConfigNum) {
+      broadcast(new CommitTransactionReply(
+          currentConfigNum, command, m.commit(), groupId, null), m.senders());
+      return;
     }
 
     String id = "txnCommit-" + command.address() + "-" + command.sequenceNumber()
@@ -606,6 +622,19 @@ public class ShardStoreServer extends ShardStoreNode {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
 
+    // Cache check FIRST — same reasoning as in handleCommitTransactionRequest.
+    // A retried COMMIT for an already-committed txn MUST return the cached
+    // partial, otherwise the coord's mergePartials produces KeyNotFound.
+    if (m.commit()) {
+      AMOResult cached = participantTxnCache.get(command.address());
+      if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+        broadcast(new CommitTransactionReply(
+            currentConfigNum, command, true, groupId,
+            (KVStoreResult) cached.result()), m.senders());
+        return;
+      }
+    }
+
     if (m.configNum() != currentConfigNum) {
       broadcast(new CommitTransactionReply(
           currentConfigNum, command, m.commit(), groupId, null), m.senders());
@@ -613,13 +642,6 @@ public class ShardStoreServer extends ShardStoreNode {
     }
 
     if (m.commit()) {
-      // Idempotent commit via cache.
-      AMOResult cached = participantTxnCache.get(command.address());
-      if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
-        broadcast(new CommitTransactionReply(
-            currentConfigNum, command, true, groupId, (KVStoreResult)cached.result()), m.senders());
-        return;
-      }
       Set<String> myKeys = ourKeysFor(txn);
       if (weHoldKeys(command, myKeys)) {
         KVStoreResult partial = executeTransactionOnOwnedShards(txn);
@@ -649,6 +671,7 @@ public class ShardStoreServer extends ShardStoreNode {
    * -----------------------------------------------------------------------------
    */
   private void handleMoveRequest(MoveRequest m, Address sender) {
+    updateMaxConfigNum(m.configNum());
     if (m.configNum() > currentConfigNum) {
       sendConfigRequest(currentConfigNum + 1);
       return;
@@ -668,6 +691,7 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handleMoveReply(MoveReply m, Address sender) {
+    updateMaxConfigNum(m.configNum());
     if (m.configNum() > currentConfigNum) {
       sendConfigRequest(currentConfigNum + 1);
     }
@@ -682,6 +706,7 @@ public class ShardStoreServer extends ShardStoreNode {
     if (!PAXOS_PING_ID.equals(m.id())) return;
     if (m.result() instanceof ShardConfig) {
       ShardConfig newConfig = (ShardConfig) m.result();
+      updateMaxConfigNum(newConfig.configNum());
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
         if (canApplyConfigChange()) {
           // Idle: propose immediately.
@@ -830,6 +855,32 @@ public class ShardStoreServer extends ShardStoreNode {
   // (no coordinator state, no per-key locks held).
   private boolean canApplyConfigChange() {
     return keyLocks.isEmpty() && activeTxns.isEmpty();
+  }
+
+  // True iff we've heard about a config newer than ours.  While this holds we
+  // refuse to admit new client transactions (and new participant PREPAREs)
+  // so existing in-flight work can drain and catch-up can fire.  Cleared
+  // implicitly when currentConfigNum advances to maxConfigNum.
+  private boolean isReconfiguring() {
+    return currentConfigNum < maxConfigNum;
+  }
+
+  // Track the highest configNum we've ever seen from anyone.  Called from
+  // every handler that receives a message bearing a configNum, so the server
+  // knows it's behind even before its own PingTimer queries the shardmaster.
+  // Also kicks the catch-up: if we're idle and there's a config we don't
+  // have, try to advance immediately.
+  private void updateMaxConfigNum(int observed) {
+    if (observed > maxConfigNum) {
+      maxConfigNum = observed;
+      // If we're idle, jump on catch-up right now instead of waiting for
+      // PingTimer.  We may not yet know what config N+1 looks like; the
+      // request to the shardmaster will arrive shortly and handlePaxosReply
+      // will propose.
+      if (isReconfiguring() && isStable() && canApplyConfigChange()) {
+        sendConfigRequest(currentConfigNum + 1);
+      }
+    }
   }
 
   // Called after every lock release / activeTxns removal — if a config change
