@@ -95,3 +95,30 @@ final class ShardMoveCmd implements Command {
 final class ShardMoveAckCmd implements Command {
     private final MoveReply reply;
 }
+
+// ---- Transaction wrapper commands (for replicating txn events via Paxos) ----
+
+@Data
+final class TxnClientReqCmd implements Command {
+    private final ShardStoreRequest request;
+}
+
+@Data
+final class TxnPrepareReqCmd implements Command {
+    private final PrepareTransactionRequest request;
+}
+
+@Data
+final class TxnPrepareReplyCmd implements Command {
+    private final PrepareTransactionReply reply;
+}
+
+@Data
+final class TxnCommitReqCmd implements Command {
+    private final CommitTransactionRequest request;
+}
+
+@Data
+final class TxnCommitReplyCmd implements Command {
+    private final CommitTransactionReply reply;
+}

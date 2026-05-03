@@ -171,21 +171,34 @@ public class ShardStoreServer extends ShardStoreNode {
    * -----------------------------------------------------------------------------
    */
 
+  // Thin wrapper: route the client's transaction request through local Paxos
+  // so every replica in the coordinator group admits the same txn at the same
+  // log slot.  AMO cache fast-path stays here (avoids paxos for retries).
   private void handleShardStoreCoordinator(ShardStoreRequest m, Address sender) {
+    AMOCommand command = m.command();
+    AMOResult cached = txnAmoCache.get(command.address());
+    if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+      send(new ShardStoreReply(currentConfigNum, cached), command.address());
+      return;
+    }
+    String id = "txnClient-" + command.address() + "-" + currentConfigNum;
+    handleMessage(new PaxosRequest(id, command.sequenceNumber(),
+        new TxnClientReqCmd(m)), paxosAddress);
+  }
+
+  // Replicated body: runs on every replica in the same paxos-decided order.
+  private void processShardStoreCoordinator(ShardStoreRequest m) {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
 
     if (!coordinatorPreChecksPass(m, command, txn)) return;
 
-    // Already-completed retries: serve from AMO cache.
     AMOResult cached = txnAmoCache.get(command.address());
     if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
       send(new ShardStoreReply(currentConfigNum, cached), command.address());
       return;
     }
 
-    // Already coordinating exactly this transaction: timer-based retries are
-    // already in flight; do nothing.
     if (currentTxn != null && currentTxn.equals(command)) {
       return;
     }
@@ -265,6 +278,13 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handlePrepareTransactionReply(PrepareTransactionReply m, Address sender) {
+    String id = "txnPrepReply-" + m.command().address() + "-" + m.command().sequenceNumber()
+        + "-" + m.groupId() + "-" + currentConfigNum;
+    handleMessage(new PaxosRequest(id, currentConfigNum,
+        new TxnPrepareReplyCmd(m)), paxosAddress);
+  }
+
+  private void processPrepareTransactionReply(PrepareTransactionReply m) {
     if (txnPhase != TxnPhase.PREPARING || currentTxn == null) return;
     if (!currentTxn.equals(m.command())) return;          // stale reply
     if (m.configNum() != currentConfigNum) return;
@@ -331,6 +351,13 @@ public class ShardStoreServer extends ShardStoreNode {
   }
 
   private void handleCommitTransactionReply(CommitTransactionReply m, Address sender) {
+    String id = "txnCommitReply-" + m.command().address() + "-" + m.command().sequenceNumber()
+        + "-" + m.groupId() + "-" + currentConfigNum;
+    handleMessage(new PaxosRequest(id, currentConfigNum,
+        new TxnCommitReplyCmd(m)), paxosAddress);
+  }
+
+  private void processCommitTransactionReply(CommitTransactionReply m) {
     if (currentTxn == null) return;
     if (!currentTxn.equals(m.command())) return;          // stale reply
     if (m.configNum() != currentConfigNum) return;
@@ -383,7 +410,23 @@ public class ShardStoreServer extends ShardStoreNode {
    * -----------------------------------------------------------------------------
    */
 
+  // Thin wrapper: route the PREPARE through paxos so all replicas in the
+  // participant group take the same vote.  AMO cache fast-path stays here for
+  // already-committed retries.
   private void handlePrepareTransactionRequest(PrepareTransactionRequest m, Address sender) {
+    AMOCommand command = m.command();
+    AMOResult cached = participantTxnCache.get(command.address());
+    if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+      broadcast(new PrepareTransactionReply(currentConfigNum, command, true, groupId), m.senders());
+      return;
+    }
+    String id = "txnPrep-" + command.address() + "-" + command.sequenceNumber()
+        + "-" + currentConfigNum;
+    handleMessage(new PaxosRequest(id, currentConfigNum,
+        new TxnPrepareReqCmd(m)), paxosAddress);
+  }
+
+  private void processPrepareTransactionRequest(PrepareTransactionRequest m) {
     AMOCommand command = m.command();
     Transaction txn = (Transaction) command.command();
 
@@ -427,7 +470,28 @@ public class ShardStoreServer extends ShardStoreNode {
     }
   }
 
+  // Thin wrapper: route the COMMIT/ABORT through paxos so all replicas in the
+  // participant group apply the transaction's writes (or release the lock) at
+  // the same paxos slot.  Cache fast-path replies straight away on a duplicate
+  // COMMIT for an already-committed transaction.
   private void handleCommitTransactionRequest(CommitTransactionRequest m, Address sender) {
+    AMOCommand command = m.command();
+    if (m.commit()) {
+      AMOResult cached = participantTxnCache.get(command.address());
+      if (cached != null && cached.sequenceNumber() >= command.sequenceNumber()) {
+        broadcast(new CommitTransactionReply(
+            currentConfigNum, command, true, groupId,
+            (KVStoreResult) cached.result()), m.senders());
+        return;
+      }
+    }
+    String id = "txnCommit-" + command.address() + "-" + command.sequenceNumber()
+        + "-" + currentConfigNum + "-" + (m.commit() ? "C" : "A");
+    handleMessage(new PaxosRequest(id, currentConfigNum,
+        new TxnCommitReqCmd(m)), paxosAddress);
+  }
+
+  private void processCommitTransactionRequest(CommitTransactionRequest m) {
     AMOCommand command = m.command();
 
     if (m.configNum() != currentConfigNum) {
@@ -524,6 +588,16 @@ public class ShardStoreServer extends ShardStoreNode {
       processMoveRequest(((ShardMoveCmd) cmd).request());
     } else if (cmd instanceof ShardMoveAckCmd) {
       processMoveReply(((ShardMoveAckCmd) cmd).reply());
+    } else if (cmd instanceof TxnClientReqCmd) {
+      processShardStoreCoordinator(((TxnClientReqCmd) cmd).request());
+    } else if (cmd instanceof TxnPrepareReqCmd) {
+      processPrepareTransactionRequest(((TxnPrepareReqCmd) cmd).request());
+    } else if (cmd instanceof TxnPrepareReplyCmd) {
+      processPrepareTransactionReply(((TxnPrepareReplyCmd) cmd).reply());
+    } else if (cmd instanceof TxnCommitReqCmd) {
+      processCommitTransactionRequest(((TxnCommitReqCmd) cmd).request());
+    } else if (cmd instanceof TxnCommitReplyCmd) {
+      processCommitTransactionReply(((TxnCommitReplyCmd) cmd).reply());
     }
   }
 
