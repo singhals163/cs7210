@@ -40,59 +40,14 @@ and idempotent under message loss and reorder.
 
 ### 2. Single-key path
 
-```
-Client                          Owning group
-  |                                 |
-  | sendCommand(Get/Put/Append)     |
-  | --(ShardStoreRequest)-->        |
-  |                                 | configNum match?  shard owned and present
-  |                                 |   in currentManagedShards?
-  |                                 | propose AMOCommand to group's Paxos
-  |                                 | -- decide --> per-shard AMOApplication
-  | <-(ShardStoreReply)----         |
-  | ClientTimer drives retries      |
-```
+![Single-key path sequence diagram](figures/single_key_path.png)
 
 Each shard has its own `AMOApplication<TransactionalKVStore>` so retries
 are deduped per-shard.
 
 ### 3. Multi-group transaction path (2PC)
 
-```
-Client                Coord group              Participant group(s)
-  |                       |                          |
-  |--(ShardStoreRequest)->|                          |
-  |                       | propose TxnClientReqCmd  |
-  |                       | -- decide -->            |
-  |                       | tryLockKeys for owned    |
-  |                       |   keys; participants =   |
-  |                       |   groups touched         |
-  |                       | I'm min(participants)?   |
-  |                       |--(PrepareTransactionRequest)->|
-  |                       |                          | propose TxnPrepareReqCmd
-  |                       |                          | -- decide -->
-  |                       |                          | tryLockKeys; gather
-  |                       |                          |   readSet values for
-  |                       |                          |   keys we own
-  |                       | <-(PrepareReply: vote, readValues)-|
-  |                       | propose TxnPrepareReplyCmd                    |
-  |                       | -- decide --> on every YES, beginCommitPhase  |
-  |                       |               aggregate readValues            |
-  |                       |                                               |
-  |                       |--(CommitTransactionRequest, fullReadValues)-->|
-  |                       |                          | propose TxnCommitReqCmd
-  |                       |                          | -- decide -->
-  |                       |                          | run txn locally with
-  |                       |                          |   the full pre-image
-  |                       |                          |   db; release locks;
-  |                       |                          |   cache partial
-  |                       | <-(CommitReply: partial)-|
-  |                       | propose TxnCommitReplyCmd                     |
-  |                       | -- decide --> add to acks                     |
-  |                       | acks complete -> finishCommit:                |
-  |                       |   merge partials, cache, releaseLocks         |
-  | <-(ShardStoreReply)---|                                                |
-```
+![Multi-group transaction (Two-Phase Commit) sequence diagram](figures/multi_group_2pc.png)
 
 Single-group transactions skip 2PC: the coord runs `txn.run` over its own
 shards directly, caches the result, and replies. `beginAbortPhase` mirrors
