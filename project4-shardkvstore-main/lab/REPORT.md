@@ -120,10 +120,10 @@ overwrite, and after the commit both keys are gone. We solve this by
   in multi-client stress tests. `Map<String, AMOCommand> keyLocks` lets
   disjoint transactions run concurrently and is re-entrant: a re-prepare
   for the same `AMOCommand` is treated as already-held.
-* **Per-transaction `CoordState` map.** `Map<AMOCommand, CoordState>
-  activeTxns` lets a coord drive multiple transactions concurrently.
-  Phase, prepareYes set, acks set, partials, and aggregated readValues
-  all live in `CoordState`.
+* **Per-transaction `CoordState` map.**
+  `Map<AMOCommand, CoordState> activeTxns` lets a coord drive multiple
+  transactions concurrently. Phase, prepareYes set, acks set, partials,
+  and aggregated readValues all live in `CoordState`.
 * **`attempt` counter on retried client / PREPARE / COMMIT messages.** The
   Project 3 `PaxosServer` keys its executed-record by `(id, seqNum)`.
   Without a per-retry suffix in the id, a request that was rejected
@@ -136,10 +136,11 @@ overwrite, and after the commit both keys are gone. We solve this by
 * **`paxosProposalAttempt` on internal proposals.** `newConfig-N`,
   `shardMove-S-N`, and `shardMoveAck-S-N` were originally keyed only on
   configNum/shardId. When a `process*` handler early-returns post-paxos
-  (e.g., `processNewConfig` finds `newConfig.configNum() != currentConfigNum
-  + 1` after an intervening apply), the next `PingTimer` re-proposes with
-  the same id and Paxos's dedup swallows it forever. Bumping a per-propose
-  counter on the id guarantees every retry gets a fresh slot.
+  (e.g., `processNewConfig` finds that `newConfig.configNum()` no longer
+  equals `currentConfigNum + 1` after an intervening apply), the next
+  `PingTimer` re-proposes with the same id and Paxos's dedup swallows it
+  forever. Bumping a per-propose counter on the id guarantees every retry
+  gets a fresh slot.
 * **Cache-before-configNum on retried COMMITs.** A retry of an already-
   committed COMMIT must return the cached partial regardless of any
   subsequent config drift, since replying `partial=null` after we've
@@ -277,7 +278,7 @@ while (slotOut < slotIn) {
     int processed = slotOut;
     slotOut += 1;                       // advance first
     updateExcutedRecord(processed, request);
-    sendRequestReply(request);          // safe to re-enter; we won't see this slot again
+    sendRequestReply(request);          // safe to re-enter
 }
 ```
 
