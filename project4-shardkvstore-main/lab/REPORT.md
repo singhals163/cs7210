@@ -14,7 +14,7 @@ inside each replica group. The system has three kinds of nodes:
    runs its own Paxos sub-node and serves the keys for the shards it
    currently owns under the latest `ShardConfig` it has applied.
 3. **`ShardStoreClient`:** Issues `Get` / `Put` / `Append` (single-key) and
-   `Transaction` (`MultiGet`, `MultiPut`, `Swap` — possibly multi-shard,
+   `Transaction` (`MultiGet`, `MultiPut`, `Swap`; possibly multi-shard,
    multi-group) commands.
 
 The work of the lab is to: (a) implement the `ShardMaster` and its
@@ -36,7 +36,7 @@ and idempotent under message loss and reordering.
   the remaining groups via a min-heap (smallest group first) so the result
   stays balanced.
 * `Move(g, shardNum)`: deep-copies, transfers `shardNum` to group `g`.
-* `Query(n)`: read-only — returns config `n` (or the latest if `n == -1`).
+* `Query(n)`: read-only. Returns config `n` (or the latest if `n == -1`).
 
 ### 2. Single-key path
 
@@ -65,7 +65,7 @@ wrapper `Command`: `ShardStoreCommand`, `NewConfigCmd`, `ShardMoveCmd`,
 `TxnPrepareReplyCmd`, `TxnCommitReqCmd`, `TxnCommitReplyCmd`. The
 convention throughout is:
 
-* `handle*(...)` runs on receipt — does pre-paxos checks, AMO/cache
+* `handle*(...)` runs on receipt and does pre-paxos checks, AMO/cache
   fast paths, then proposes the wrapper to Paxos.
 * `process*(...)` runs from `handlePaxosDecision` and is the replicated
   body: every replica sees the same command in the same order.
@@ -76,7 +76,7 @@ convention throughout is:
   to the ShardMaster (only when `isStable()` to avoid query storms during
   transfers).
 * On `handlePaxosReply` carrying `ShardConfig N+1`:
-    * if `isStable() && canApplyConfigChange()` → propose `NewConfigCmd(N+1)`
+    * if `isStable() && canApplyConfigChange()` propose `NewConfigCmd(N+1)`
       with a fresh `paxosProposalAttempt` suffix.
     * else stash as `pendingConfig` (and set `pendingConfigChange` so we
       reject new client work until it drains).
@@ -91,7 +91,7 @@ convention throughout is:
   released or an active txn finishes; it arms a 1 ms `ConfigProposeTimer`
   that, when it fires, proposes the stashed `NewConfigCmd`. We *cannot*
   propose synchronously from the lock-release paths because they run inside
-  a Paxos decide handler — see Design Decisions.
+  a Paxos decide handler (see Design Decisions).
 
 ### 6. Cross-shard transaction execution
 
@@ -99,7 +99,7 @@ Each participant evaluates the txn in `executeTransactionOnOwnedShards`,
 which builds a `db: Map<String, String>` and calls `txn.run(db)`. The
 catch is that `Swap.run(db)` reads both keys and writes both keys. If a
 participant only has its own keys in `db`, it sees the *other* key as
-missing and falls into `Swap`'s "key not present, delete" branch — so
+missing and falls into `Swap`'s "key not present, delete" branch, so
 each side independently deletes the very key it was supposed to
 overwrite, and after the commit both keys are gone. We solve this by
 **shipping read values across the 2PC**:
@@ -121,14 +121,14 @@ overwrite, and after the commit both keys are gone. We solve this by
   disjoint transactions run concurrently and is re-entrant: a re-prepare
   for the same `AMOCommand` is treated as already-held.
 * **Per-transaction `CoordState` map.** `Map<AMOCommand, CoordState>
-  activeTxns` lets a coord drive multiple transactions concurrently —
-  phase, prepareYes set, acks set, partials, and aggregated readValues
+  activeTxns` lets a coord drive multiple transactions concurrently.
+  Phase, prepareYes set, acks set, partials, and aggregated readValues
   all live in `CoordState`.
 * **`attempt` counter on retried client / PREPARE / COMMIT messages.** The
   Project 3 `PaxosServer` keys its executed-record by `(id, seqNum)`.
   Without a per-retry suffix in the id, a request that was rejected
   post-paxos (transient lock conflict, configNum mismatch, etc.) has its
-  retry silently dedup-dropped — paxos sees it as already-completed and
+  retry silently dedup-dropped: paxos sees it as already-completed and
   never delivers another `PaxosDecision`, so the request stalls forever.
   The client bumps `attempt` in `onClientTimer`; the coordinator bumps it
   in `PrepareTimer` / `CommitTimer`. Each retry therefore carries a
@@ -142,11 +142,11 @@ overwrite, and after the commit both keys are gone. We solve this by
   counter on the id guarantees every retry gets a fresh slot.
 * **Cache-before-configNum on retried COMMITs.** A retry of an already-
   committed COMMIT must return the cached partial regardless of any
-  subsequent config drift — replying `partial=null` after we've cached the
-  real partial would let the coord's `mergePartials` produce phantom
-  `KEY_NOT_FOUND`s for keys we actually wrote. The cache check therefore
-  precedes the configNum check in both `handle` and `process` versions of
-  `CommitTransactionRequest`.
+  subsequent config drift, since replying `partial=null` after we've
+  cached the real partial would let the coord's `mergePartials` produce
+  phantom `KEY_NOT_FOUND`s for keys we actually wrote. The cache check
+  therefore precedes the configNum check in both `handle` and `process`
+  versions of `CommitTransactionRequest`.
 * **Deferred reconfiguration.** We never apply `ShardConfig N+1` while any
   lock is held (`canApplyConfigChange()` checks both `keyLocks.isEmpty()`
   and `activeTxns.isEmpty()`). This preserves the invariant that a server
@@ -175,7 +175,7 @@ overwrite, and after the commit both keys are gone. We solve this by
 * **Defensive `releaseLocks` on configNum-mismatched COMMIT/ABORT.** By
   invariant a participant holding a lock for txn X cannot have advanced
   past X's config, but if that invariant is ever violated the original
-  configNum-mismatch path acked without releasing the lock — producing
+  configNum-mismatch path acked without releasing the lock, producing
   a permanent wedge that pinned `canApplyConfigChange()` at false. The
   fixed path is: at the pre-paxos `handle*` site, if no lock is held for
   this command we ack directly (nothing to release); if a lock IS held
@@ -185,10 +185,18 @@ overwrite, and after the commit both keys are gone. We solve this by
 
 ## Missing Components
 
+**Active Gradescope submission.** The code on this branch corresponds to
+**submission 13**, which is the one I have activated for grading. I
+later pushed a **submission 15** that managed to pass test 4.10 (the
+single-server random-search test), but in fixing the search path it
+regressed tests 4.5 and 4.6, losing more total points than it
+gained. Submission 13 is therefore the higher-scoring snapshot and is
+the one being graded; the failure list below reflects submission 13.
+
 The submitted code passes the rest of the suite but six tests fail:
 
-* **4.7 (`test07ConstantMovementSingleServer`)** — single-server-per-group
-  with constant shard movement (every 4 s) + `networkDeliverRate(0.8)`.
+* **4.7 (`test07ConstantMovementSingleServer`):** single-server-per-group
+  with constant shard movement (every 4 s) plus `networkDeliverRate(0.8)`.
   Catch-up to new configs is bottlenecked on `onPingTimer` only querying
   the ShardMaster while `isStable()` and `handlePaxosReply` only acting
   on a config when `isStable() && canApplyConfigChange()`. Under sustained
@@ -198,26 +206,26 @@ The submitted code passes the rest of the suite but six tests fail:
   rejection driven by a `maxConfigNum` watermark; each fixed 4.7
   partially but regressed the reliable / non-movement tests, so we
   reverted to a conservative version.
-* **4.10 (`test10SingleServerRandomSearch`)** — DFS search test. The
+* **4.10 (`test10SingleServerRandomSearch`):** DFS search test. The
   per-retry `attempt+1` suffix on internal Paxos proposal ids makes
   every retransmission a distinct state, so the reachable-state graph
   explodes and the search at `maxDepth(1000)` exhausts its time budget
   before reaching the goal predicate. A future fix would equate states
   that differ only in the retry counter.
-* **4.15 (`test15RepeatedPutsGets`)** — multi-server-per-group, reliable
+* **4.15 (`test15RepeatedPutsGets`):** multi-server-per-group, reliable
   network, no shard movement, 5 clients × 50 s. Most of the time the
   workload runs cleanly, but coordinated 2PC across three groups (each
   doing its own Paxos round-trip per PREPARE/COMMIT) occasionally
   breaches the 4000 ms `MaxWaitTime` bound. Likely root cause: paxos
   slot growth from per-attempt unique ids inflates GC overhead on the
   per-group `PaxosServer`.
-* **4.16 (`test16RepeatedPutsGetsUnreliableMultiServer`)** — same as
+* **4.16 (`test16RepeatedPutsGetsUnreliableMultiServer`):** same as
   4.15 plus `networkDeliverRate(0.8)`. Same latency profile, just with
   more retries; long-tail max-wait blows the 4000 ms threshold.
-* **4.17 (`test17ConstantMovement`)** — multi-server analogue of 4.7
+* **4.17 (`test17ConstantMovement`):** multi-server analogue of 4.7
   (movement + 0.8 delivery + 3-replica groups). Inherits both 4.7's
   catch-up bottleneck and 4.16's tail-latency issue.
-* **5.3 (`test03MultiClientMultiGroupSearch`)** — multi-client,
+* **5.3 (`test03MultiClientMultiGroupSearch`):** multi-client,
   multi-group search test for the transactional path. Same state-space
   explosion mechanism as 4.10, made worse by the 2PC paths adding
   multiple per-message paxos slots per client request.
@@ -226,12 +234,12 @@ The submitted code passes the rest of the suite but six tests fail:
 
 * **[Lab 4 Handout](https://github.gatech.edu/cs7210-spr26/project4-shardkvstore):** Spec for `ShardMaster`, `ShardStoreServer`, `ShardStoreClient`, the message contract, and the test invariants (RESULTS_OK, MULTI_GETS_MATCH, max-wait-time bound).
 * **[Lab 3 Handout](https://github.gatech.edu/cs7210-spr26/project3-paxos):** Paxos engine reused unchanged here as the per-group replication backbone; reviewed its `whetherRequestComplete` / `whetherRequestInProposal` dedup contract while debugging the `(id, seqNum)` issues that led to the `attempt` counters.
-* **DSLabs framework source (`framework/`):** `Node.handleMessage`, sub-node addressing via `Address.subAddress`, and `set(Timer, delay)` semantics — needed to choose between synchronous reentry and timer-deferred propose for `maybeTriggerPendingConfigChange`.
+* **DSLabs framework source (`framework/`):** `Node.handleMessage`, sub-node addressing via `Address.subAddress`, and `set(Timer, delay)` semantics, needed to choose between synchronous reentry and timer-deferred propose for `maybeTriggerPendingConfigChange`.
 * **Course lecture notes** on Multi-Paxos (log-structured replication) and Two-Phase Commit (PREPARE/COMMIT message exchange).
-* **Tanenbaum, *Distributed Systems*** — 2PC protocol overview used for the abort/commit phase design.
-* **Anthropic Claude** — used moderately, mostly to think out loud while reading failing test logs and to sketch a couple of small code patches. Specific things it helped surface (and which I then verified and implemented myself): (1) the cross-shard `Swap` correctness bug — that each participant's local `db` was missing the other shard's value, leading to the `KEY_NOT_FOUND` delete branch; (2) the suggestion to ship `readValues` across the 2PC as the cleanest way to fix it; (3) noticing that the per-retry `attempt` suffix idea also needed to be applied to internal `newConfig-N` / `shardMove-S-N` proposals to avoid post-paxos dedup. Final designs, invariants, and the code are mine.
-* **[Java `HashMap` / `Map` interface](https://docs.oracle.com/javase/8/docs/api/java/util/Map.html)** — for `entrySet().removeIf(...)` (used in `releaseLocks`) and re-entrant `put` semantics on the `keyLocks` map.
-* **[Apache Commons Lang `Pair`](https://commons.apache.org/proper/commons-lang/apidocs/org/apache/commons/lang3/tuple/Pair.html)** — used in `ShardConfig.groupInfo()` to bundle each group's servers and shards.
+* **Tanenbaum, *Distributed Systems*:** 2PC protocol overview used for the abort/commit phase design.
+* **Anthropic Claude:** used moderately, mostly to think out loud while reading failing test logs and to sketch a couple of small code patches. Specific things it helped surface (and which I then verified and implemented myself): (1) the cross-shard `Swap` correctness bug, where each participant's local `db` was missing the other shard's value, leading to the `KEY_NOT_FOUND` delete branch; (2) the suggestion to ship `readValues` across the 2PC as the cleanest way to fix it; (3) noticing that the per-retry `attempt` suffix idea also needed to be applied to internal `newConfig-N` / `shardMove-S-N` proposals to avoid post-paxos dedup. Final designs, invariants, and the code are mine.
+* **[Java `HashMap` / `Map` interface](https://docs.oracle.com/javase/8/docs/api/java/util/Map.html):** for `entrySet().removeIf(...)` (used in `releaseLocks`) and re-entrant `put` semantics on the `keyLocks` map.
+* **[Apache Commons Lang `Pair`](https://commons.apache.org/proper/commons-lang/apidocs/org/apache/commons/lang3/tuple/Pair.html):** used in `ShardConfig.groupInfo()` to bundle each group's servers and shards.
 
 ## Extra (Optional)
 
@@ -252,10 +260,10 @@ If `sendRequestReply` triggers any code path that ends up calling
 `handleMessage(new PaxosRequest(...), paxosAddress)` synchronously (for
 example, the application's commit handler doing a follow-up Paxos
 propose), the inner drain re-reads the same `slotOut`, finds it still
-`CHOSEN`, and recursively drains the same slot — `StackOverflowError`.
+`CHOSEN`, and recursively drains the same slot, hitting `StackOverflowError`.
 We hit this in test 4.7 along the chain
-`processCommitTransactionRequest` → `maybeTriggerPendingConfigChange` →
-`handleMessage(new PaxosRequest("newConfig-N-X", ...), paxosAddress)`.
+`processCommitTransactionRequest` then `maybeTriggerPendingConfigChange`
+then `handleMessage(new PaxosRequest("newConfig-N-X", ...), paxosAddress)`.
 
 **Proposed fix.** Increment `slotOut` *before* calling `sendRequestReply`,
 so a re-entrant drain finds the now-incremented `slotOut` and either
