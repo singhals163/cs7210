@@ -40,6 +40,7 @@ import static dslabs.shardkv.PingTimer.PING_RETRY_MILLIS;
 import static dslabs.shardkv.MoveTimer.MOVE_RETRY_MILLIS;
 import static dslabs.shardkv.PrepareTimer.PREPARE_RETRY_MILLIS;
 import static dslabs.shardkv.CommitTimer.COMMIT_RETRY_MILLIS;
+import static dslabs.shardkv.ConfigProposeTimer.CONFIG_PROPOSE_DELAY_MILLIS;
 
 @ToString(callSuper = true)
 @EqualsAndHashCode(callSuper = true)
@@ -113,6 +114,11 @@ public class ShardStoreServer extends ShardStoreNode {
   // another PaxosDecision.  Bumping the counter per propose guarantees
   // a fresh paxos slot for every retry.
   private int paxosProposalAttempt = 0;
+
+  // True iff a ConfigProposeTimer is already armed.  Prevents queueing
+  // multiple timers (and thus multiple paxos slots) for the same pending
+  // config change when several lock-release paths fire in quick succession.
+  private boolean configProposeTimerArmed = false;
 
   /*
    * -----------------------------------------------------------------------------
@@ -622,12 +628,22 @@ public class ShardStoreServer extends ShardStoreNode {
       }
     }
 
-    // Stale config (and not in our cache): ack directly so the coordinator
-    // can drop us; we don't burn a paxos slot on a no-op.
+    // Stale config and we don't hold a lock for this txn: ack directly so the
+    // coordinator can drop us; we don't burn a paxos slot on a no-op.  But
+    // *if* we still hold a lock for this command (acquired at PREPARE under
+    // a previous config and never released), we MUST go through paxos so
+    // processCommitTransactionRequest can release it on every replica —
+    // otherwise the lock pins canApplyConfigChange=false forever and the
+    // server wedges on its current config.  Single-server paxos reproduces
+    // this as the test-4.7 deadlock; multi-server replicas would diverge if
+    // we released directly here.
     if (m.configNum() != currentConfigNum) {
-      broadcast(new CommitTransactionReply(
-          currentConfigNum, command, m.commit(), groupId, null), m.senders());
-      return;
+      if (!holdsLockFor(command)) {
+        broadcast(new CommitTransactionReply(
+            currentConfigNum, command, m.commit(), groupId, null), m.senders());
+        return;
+      }
+      // fall through to paxos so the lock release is replicated.
     }
 
     String id = "txnCommit-" + command.address() + "-" + command.sequenceNumber()
@@ -655,8 +671,14 @@ public class ShardStoreServer extends ShardStoreNode {
     }
 
     if (m.configNum() != currentConfigNum) {
+      // Release any lock we still hold for this command (defensive; should
+      // be rare since canApplyConfigChange normally pins us at the txn's
+      // config).  Do NOT execute the txn — at the new config our shard
+      // ownership may differ; coord's merge tolerates a null partial.
+      releaseLocks(command);
       broadcast(new CommitTransactionReply(
           currentConfigNum, command, m.commit(), groupId, null), m.senders());
+      maybeTriggerPendingConfigChange();
       return;
     }
 
@@ -881,6 +903,18 @@ public class ShardStoreServer extends ShardStoreNode {
     keyLocks.entrySet().removeIf(e -> cmd.equals(e.getValue()));
   }
 
+  // True iff at least one key in keyLocks is held by cmd.  Used pre-paxos in
+  // handleCommitTransactionRequest to decide whether a configNum-mismatched
+  // COMMIT/ABORT can be acked directly (no lock to release) or must go
+  // through paxos so processCommitTransactionRequest can release on every
+  // replica.
+  private boolean holdsLockFor(AMOCommand cmd) {
+    for (AMOCommand holder : keyLocks.values()) {
+      if (cmd.equals(holder)) return true;
+    }
+    return false;
+  }
+
   // ----- Deferred-reconfiguration helpers -----
 
   // Safe to apply a config change right now iff there are no in-flight txns
@@ -891,7 +925,27 @@ public class ShardStoreServer extends ShardStoreNode {
 
   // Called after every lock release / activeTxns removal — if a config change
   // was deferred and we're now idle, fire the proposal.
+  // Arms a ConfigProposeTimer to fire on the next event-loop iteration; the
+  // timer handler does the actual paxos propose.  We deliberately do *not*
+  // call handleMessage(PaxosRequest, paxosAddress) synchronously here:
+  // maybeTriggerPendingConfigChange is invoked from inside paxos-decide
+  // handlers (processCommitTransactionRequest, finishCommit, finishAbort,
+  // single-group fast path), and the local PaxosServer's drain loop bumps
+  // its slotOut *after* sendRequestReply, so a synchronous re-propose
+  // re-enters the same drain at the same slotOut and recurses without
+  // bound (see test 4.7 stack overflow).
   private void maybeTriggerPendingConfigChange() {
+    if (pendingConfigChange && pendingConfig != null && canApplyConfigChange()
+        && !configProposeTimerArmed) {
+      configProposeTimerArmed = true;
+      set(new ConfigProposeTimer(), CONFIG_PROPOSE_DELAY_MILLIS);
+    }
+  }
+
+  void onConfigProposeTimer(ConfigProposeTimer t) {
+    configProposeTimerArmed = false;
+    // Re-check conditions; pendingConfigChange may have been cleared by
+    // a different path, or canApply may have flipped back to false.
     if (pendingConfigChange && pendingConfig != null && canApplyConfigChange()) {
       ShardConfig cfg = pendingConfig;
       // NB: do NOT clear `pendingConfigChange` yet.  We keep blocking new

@@ -38,3 +38,15 @@ final class CommitTimer implements Timer {
   final CommitTransactionRequest request;
   static final int COMMIT_RETRY_MILLIS = 100;
 }
+
+// Used by maybeTriggerPendingConfigChange to *defer* the newConfig paxos
+// propose to the next event-loop iteration.  Synchronously invoking
+// handleMessage(PaxosRequest, paxosAddress) from inside a paxos decide
+// handler (e.g. processCommitTransactionRequest) re-enters paxos's drain
+// loop while its `slotOut` is still pointing at the slot that's currently
+// being drained, causing infinite recursion / StackOverflow.  A 1ms timer
+// breaks the synchronous chain.
+@Data
+final class ConfigProposeTimer implements Timer {
+  static final int CONFIG_PROPOSE_DELAY_MILLIS = 1;
+}
