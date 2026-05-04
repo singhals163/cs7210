@@ -104,6 +104,16 @@ public class ShardStoreServer extends ShardStoreNode {
   private boolean pendingConfigChange = false;
   private ShardConfig pendingConfig = null;
 
+  // Monotonic counter used as a "retry attempt" suffix on internal paxos
+  // proposal ids (newConfig-*, shardMove-*, shardMoveAck-*).  Without it,
+  // a second propose of the same logical request (e.g. a PingTimer firing
+  // newConfig-4 again because the previous decide's processNewConfig hit
+  // a post-paxos pre-check and early-returned) carries the same (id,
+  // sequenceNum) — paxos treats it as a duplicate and never delivers
+  // another PaxosDecision.  Bumping the counter per propose guarantees
+  // a fresh paxos slot for every retry.
+  private int paxosProposalAttempt = 0;
+
   /*
    * -----------------------------------------------------------------------------
    * Construction and Initialization
@@ -692,8 +702,13 @@ public class ShardStoreServer extends ShardStoreNode {
     }
     if (currentConfig.containsKey(groupId) && currentConfig.get(groupId).getRight().contains(m.shardId())) {
       if (!currentManagedShards.contains(m.shardId())) {
-        handleMessage(new PaxosRequest("shardMove-" + m.shardId() + "-" + m.configNum(),
-            m.configNum(), new ShardMoveCmd(m)), paxosAddress);
+        // Fresh attempt suffix per propose so a previously-deduped paxos slot
+        // (whose decide hit a post-paxos pre-check and early-returned) doesn't
+        // permanently swallow this shardMove request.
+        String id = "shardMove-" + m.shardId() + "-" + m.configNum()
+            + "-" + (++paxosProposalAttempt);
+        handleMessage(new PaxosRequest(id, m.configNum(),
+            new ShardMoveCmd(m)), paxosAddress);
       } else {
         broadcast(new MoveReply(currentConfigNum, m.shardId()), m.senders());
       }
@@ -706,8 +721,10 @@ public class ShardStoreServer extends ShardStoreNode {
     }
     if (m.configNum() != currentConfigNum) return;
     if (currentManagedShards.contains(m.shardId())) {
-      handleMessage(new PaxosRequest("shardMoveAck-" + m.shardId() + "-" + m.configNum(),
-          m.configNum(), new ShardMoveAckCmd(m)), paxosAddress);
+      String id = "shardMoveAck-" + m.shardId() + "-" + m.configNum()
+          + "-" + (++paxosProposalAttempt);
+      handleMessage(new PaxosRequest(id, m.configNum(),
+          new ShardMoveAckCmd(m)), paxosAddress);
     }
   }
 
@@ -717,9 +734,13 @@ public class ShardStoreServer extends ShardStoreNode {
       ShardConfig newConfig = (ShardConfig) m.result();
       if (newConfig.configNum() == currentConfigNum + 1 && isStable()) {
         if (canApplyConfigChange()) {
-          // Idle: propose immediately.
-          handleMessage(new PaxosRequest("newConfig-" + newConfig.configNum(),
-              newConfig.configNum(), new NewConfigCmd(newConfig)), paxosAddress);
+          // Idle: propose immediately.  Fresh attempt suffix in case an earlier
+          // newConfig-N proposal got deduped at paxos but its decide hit a
+          // post-paxos pre-check and early-returned without advancing.
+          String id = "newConfig-" + newConfig.configNum()
+              + "-" + (++paxosProposalAttempt);
+          handleMessage(new PaxosRequest(id, newConfig.configNum(),
+              new NewConfigCmd(newConfig)), paxosAddress);
         } else {
           // In-flight transaction(s) — defer.  maybeTriggerPendingConfigChange
           // will propose once those finish and release their locks.
@@ -876,8 +897,9 @@ public class ShardStoreServer extends ShardStoreNode {
       // NB: do NOT clear `pendingConfigChange` yet.  We keep blocking new
       // client work until processNewConfig actually applies; the flag is
       // cleared there.
-      handleMessage(new PaxosRequest("newConfig-" + cfg.configNum(),
-          cfg.configNum(), new NewConfigCmd(cfg)), paxosAddress);
+      String id = "newConfig-" + cfg.configNum() + "-" + (++paxosProposalAttempt);
+      handleMessage(new PaxosRequest(id, cfg.configNum(),
+          new NewConfigCmd(cfg)), paxosAddress);
     }
   }
 
